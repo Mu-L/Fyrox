@@ -24,10 +24,12 @@
 use crate::renderer::framework::{
     buffer::{Buffer, BufferKind, BufferUsage},
     error::FrameworkError,
+    framebuffer::{BufferDataUsage, ResourceBinding},
     server::GraphicsServer,
     uniform::{ByteStorage, DynamicUniformBuffer, UniformBuffer},
 };
 use fxhash::FxHashMap;
+use fyrox_graphics::server::SharedGraphicsServer;
 use std::cell::RefCell;
 
 #[derive(Default)]
@@ -65,22 +67,25 @@ impl UniformBufferSet {
 /// (guaranteed to be at least 16kb and on vast majority of GPUs the upper limit is 65kb) and they
 /// are intended to be used as a storage for relatively small set of data that can fit into L1 cache
 /// of a GPU for very fast access.
-#[derive(Default)]
 pub struct UniformBufferCache {
+    server: SharedGraphicsServer,
     cache: RefCell<FxHashMap<usize, UniformBufferSet>>,
 }
 
 impl UniformBufferCache {
+    pub fn new(server: SharedGraphicsServer) -> Self {
+        Self {
+            server,
+            cache: Default::default(),
+        }
+    }
+
     /// Reserves one of the existing uniform buffers of the given size. If there's no such free buffer,
     /// this method creates a new one and reserves it for further use.
-    pub fn get_or_create<'a>(
-        &'a self,
-        server: &dyn GraphicsServer,
-        size: usize,
-    ) -> Result<&'a dyn Buffer, FrameworkError> {
+    pub fn get_or_create<'a>(&'a self, size: usize) -> Result<&'a dyn Buffer, FrameworkError> {
         let mut cache = self.cache.borrow_mut();
         let set = cache.entry(size).or_default();
-        let buffer = set.get_or_create(size, server)?;
+        let buffer = set.get_or_create(size, &*self.server)?;
         // SAFETY: GPU buffer "lives" in memory heap, so any potential memory reallocation of the
         // hash map won't affect the returned reference. Also, buffers cannot be deleted so the
         // reference is also valid. These reasons allows to extend lifetime to the lifetime of self.
@@ -89,16 +94,12 @@ impl UniformBufferCache {
 
     /// Fetches a suitable (or creates new one) GPU uniform buffer for the given CPU uniform buffer
     /// and writes the data to it, returns a reference to the buffer.
-    pub fn write<T>(
-        &self,
-        server: &dyn GraphicsServer,
-        uniform_buffer: UniformBuffer<T>,
-    ) -> Result<&dyn Buffer, FrameworkError>
+    pub fn write<T>(&self, uniform_buffer: UniformBuffer<T>) -> Result<&dyn Buffer, FrameworkError>
     where
         T: ByteStorage,
     {
         let data = uniform_buffer.finish();
-        let buffer = self.get_or_create(server, data.bytes_count())?;
+        let buffer = self.get_or_create(data.bytes_count())?;
         buffer.write_data(data.bytes())?;
         Ok(buffer)
     }
@@ -121,20 +122,16 @@ impl UniformBufferCache {
     }
 }
 
-pub struct UniformDataLocation<'a> {
-    pub buffer: &'a dyn Buffer,
-    pub offset: usize,
-    pub size: usize,
-}
-
 struct Page {
     dynamic: DynamicUniformBuffer,
+    is_submitted: bool,
 }
 
-struct Block {
-    page: usize,
-    offset: usize,
-    size: usize,
+#[derive(Clone, Debug)]
+pub struct UniformBlockLocation {
+    pub page: usize,
+    pub offset: usize,
+    pub size: usize,
 }
 
 pub struct UniformMemoryAllocator {
@@ -142,7 +139,7 @@ pub struct UniformMemoryAllocator {
     block_alignment: usize,
     max_uniform_buffer_size: usize,
     pages: Vec<Page>,
-    blocks: Vec<Block>,
+    blocks: Vec<UniformBlockLocation>,
 }
 
 impl UniformMemoryAllocator {
@@ -161,15 +158,19 @@ impl UniformMemoryAllocator {
         self.blocks.clear();
     }
 
-    pub fn allocate<T>(&mut self, buffer: UniformBuffer<T>)
+    pub fn allocate<T>(&mut self, buffer: UniformBuffer<T>) -> UniformBlockLocation
     where
         T: ByteStorage,
     {
         let data = buffer.finish();
+        assert!(data.bytes_count() > 0);
         assert!(data.bytes_count() < self.max_uniform_buffer_size);
 
         let page_index = match self.pages.iter().position(|page| {
-            self.max_uniform_buffer_size - page.dynamic.len() >= data.bytes_count()
+            let write_position = page
+                .dynamic
+                .next_write_aligned_position(self.block_alignment);
+            self.max_uniform_buffer_size - write_position >= data.bytes_count()
         }) {
             Some(page_index) => page_index,
             None => {
@@ -178,28 +179,30 @@ impl UniformMemoryAllocator {
                     dynamic: UniformBuffer::with_storage(Vec::with_capacity(
                         self.max_uniform_buffer_size,
                     )),
+                    is_submitted: false,
                 });
                 page_index
             }
         };
 
-        let offset = self.pages[page_index]
+        let page = &mut self.pages[page_index];
+        page.is_submitted = false;
+        let offset = page
             .dynamic
             .write_bytes_with_alignment(data.bytes(), self.block_alignment);
 
-        self.blocks.push(Block {
+        let block = UniformBlockLocation {
             page: page_index,
             offset,
             size: data.bytes_count(),
-        })
+        };
+        self.blocks.push(block.clone());
+        block
     }
 
-    pub fn submit<'a>(
-        &'a mut self,
-        server: &dyn GraphicsServer,
-    ) -> Result<Vec<UniformDataLocation<'a>>, FrameworkError> {
-        if self.pages.len() < self.gpu_buffers.len() {
-            for _ in 0..(self.gpu_buffers.len() - self.pages.len()) {
+    pub fn upload(&mut self, server: &dyn GraphicsServer) -> Result<(), FrameworkError> {
+        if self.gpu_buffers.len() < self.pages.len() {
+            for _ in 0..(self.pages.len() - self.gpu_buffers.len()) {
                 let buffer = server.create_buffer(
                     self.max_uniform_buffer_size,
                     BufferKind::Uniform,
@@ -209,20 +212,30 @@ impl UniformMemoryAllocator {
             }
         }
 
-        for (page, gpu_buffer) in self.pages.iter().zip(self.gpu_buffers.iter()) {
-            gpu_buffer.write_data(page.dynamic.storage().bytes())?;
+        for (page, gpu_buffer) in self.pages.iter_mut().zip(self.gpu_buffers.iter()) {
+            if !page.is_submitted {
+                let bytes = page.dynamic.storage().bytes();
+                assert!(bytes.len() <= self.max_uniform_buffer_size);
+                gpu_buffer.write_data(bytes)?;
+                page.is_submitted = true;
+            }
         }
 
-        let mut locations = Vec::with_capacity(self.blocks.len());
+        Ok(())
+    }
 
-        for block in self.blocks.iter() {
-            locations.push(UniformDataLocation {
-                buffer: &*self.gpu_buffers[block.page],
+    pub fn block_to_binding(
+        &self,
+        block: UniformBlockLocation,
+        shader_location: usize,
+    ) -> ResourceBinding {
+        ResourceBinding::Buffer {
+            buffer: &*self.gpu_buffers[block.page],
+            shader_location,
+            data_usage: BufferDataUsage::UseSegment {
                 offset: block.offset,
                 size: block.size,
-            })
+            },
         }
-
-        Ok(locations)
     }
 }

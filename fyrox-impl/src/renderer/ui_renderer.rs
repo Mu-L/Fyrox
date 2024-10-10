@@ -20,7 +20,6 @@
 
 //! See [`UiRenderer`] docs.
 
-use crate::renderer::flat_shader::FlatShader;
 use crate::{
     asset::untyped::ResourceKind,
     core::{
@@ -35,17 +34,19 @@ use crate::{
     },
     renderer::{
         cache::uniform::UniformBufferCache,
+        flat_shader::FlatShader,
         framework::{
             buffer::BufferUsage,
             error::FrameworkError,
-            framebuffer::FrameBuffer,
+            framebuffer::{FrameBuffer, ResourceBindGroup, ResourceBinding},
             geometry_buffer::{
-                AttributeDefinition, AttributeKind, BufferBuilder, GeometryBuffer,
-                GeometryBufferBuilder,
+                AttributeDefinition, AttributeKind, GeometryBuffer, GeometryBufferDescriptor,
+                VertexBufferData, VertexBufferDescriptor,
             },
-            gl::server::GlGraphicsServer,
             gpu_program::{GpuProgram, UniformLocation},
             gpu_texture::GpuTexture,
+            server::GraphicsServer,
+            uniform::StaticUniformBuffer,
             BlendFactor, BlendFunc, BlendParameters, ColorMask, CompareFunc, DrawParameters,
             ElementKind, ElementRange, ScissorBox, StencilAction, StencilFunc, StencilOp,
         },
@@ -53,9 +54,6 @@ use crate::{
     },
     resource::texture::{Texture, TextureKind, TexturePixelKind, TextureResource},
 };
-use fyrox_graphics::framebuffer::{ResourceBindGroup, ResourceBinding};
-use fyrox_graphics::server::GraphicsServer;
-use fyrox_graphics::uniform::StaticUniformBuffer;
 use std::{cell::RefCell, rc::Rc};
 
 struct UiShader {
@@ -65,7 +63,7 @@ struct UiShader {
 }
 
 impl UiShader {
-    pub fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
+    pub fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
         let fragment_source = include_str!("shaders/ui_fs.glsl");
         let vertex_source = include_str!("shaders/ui_vs.glsl");
         let program = server.create_program("UIShader", vertex_source, fragment_source)?;
@@ -80,14 +78,14 @@ impl UiShader {
 /// User interface renderer allows you to render drawing context in specified render target.
 pub struct UiRenderer {
     shader: UiShader,
-    geometry_buffer: GeometryBuffer,
-    clipping_geometry_buffer: GeometryBuffer,
+    geometry_buffer: Box<dyn GeometryBuffer>,
+    clipping_geometry_buffer: Box<dyn GeometryBuffer>,
 }
 
 /// A set of parameters to render a specified user interface drawing context.
 pub struct UiRenderContext<'a, 'b, 'c> {
-    /// Render pipeline state.
-    pub state: &'a GlGraphicsServer,
+    /// Graphics server.
+    pub server: &'a dyn GraphicsServer,
     /// Viewport to where render the user interface.
     pub viewport: Rect<i32>,
     /// Frame buffer to where render the user interface.
@@ -109,47 +107,60 @@ pub struct UiRenderContext<'a, 'b, 'c> {
 }
 
 impl UiRenderer {
-    pub(in crate::renderer) fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
-        let geometry_buffer = GeometryBufferBuilder::new(ElementKind::Triangle)
-            .with_buffer_builder(
-                BufferBuilder::new::<crate::gui::draw::Vertex>(BufferUsage::DynamicDraw, None)
-                    .with_attribute(AttributeDefinition {
+    pub(in crate::renderer) fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
+        let geometry_buffer_desc = GeometryBufferDescriptor {
+            element_kind: ElementKind::Triangle,
+            buffers: &[VertexBufferDescriptor {
+                usage: BufferUsage::DynamicDraw,
+                attributes: &[
+                    AttributeDefinition {
                         location: 0,
-                        kind: AttributeKind::Float2,
+                        kind: AttributeKind::Float,
+                        component_count: 2,
                         normalized: false,
                         divisor: 0,
-                    })
-                    .with_attribute(AttributeDefinition {
+                    },
+                    AttributeDefinition {
                         location: 1,
-                        kind: AttributeKind::Float2,
+                        kind: AttributeKind::Float,
+                        component_count: 2,
                         normalized: false,
                         divisor: 0,
-                    })
-                    .with_attribute(AttributeDefinition {
+                    },
+                    AttributeDefinition {
                         location: 2,
-                        kind: AttributeKind::UnsignedByte4,
+                        kind: AttributeKind::UnsignedByte,
+                        component_count: 4,
                         normalized: true, // Make sure [0; 255] -> [0; 1]
                         divisor: 0,
-                    }),
-            )
-            .build(server)?;
+                    },
+                ],
+                data: VertexBufferData::new::<crate::gui::draw::Vertex>(None),
+            }],
+        };
 
-        let clipping_geometry_buffer = GeometryBufferBuilder::new(ElementKind::Triangle)
-            .with_buffer_builder(
-                BufferBuilder::new::<crate::gui::draw::Vertex>(BufferUsage::DynamicDraw, None)
+        let clipping_geometry_buffer_desc = GeometryBufferDescriptor {
+            element_kind: ElementKind::Triangle,
+            buffers: &[VertexBufferDescriptor {
+                usage: BufferUsage::DynamicDraw,
+                attributes: &[
                     // We're interested only in position. Fragment shader won't run for clipping geometry anyway.
-                    .with_attribute(AttributeDefinition {
+                    AttributeDefinition {
                         location: 0,
-                        kind: AttributeKind::Float2,
+                        kind: AttributeKind::Float,
+                        component_count: 2,
                         normalized: false,
                         divisor: 0,
-                    }),
-            )
-            .build(server)?;
+                    },
+                ],
+                data: VertexBufferData::new::<crate::gui::draw::Vertex>(None),
+            }],
+        };
 
         Ok(Self {
-            geometry_buffer,
-            clipping_geometry_buffer,
+            geometry_buffer: server.create_geometry_buffer(geometry_buffer_desc)?,
+            clipping_geometry_buffer: server
+                .create_geometry_buffer(clipping_geometry_buffer_desc)?,
             shader: UiShader::new(server)?,
         })
     }
@@ -160,7 +171,7 @@ impl UiRenderer {
         args: UiRenderContext,
     ) -> Result<RenderPassStatistics, FrameworkError> {
         let UiRenderContext {
-            state: server,
+            server,
             viewport,
             frame_buffer,
             frame_width,
@@ -175,10 +186,9 @@ impl UiRenderer {
         let mut statistics = RenderPassStatistics::default();
 
         self.geometry_buffer
-            .set_buffer_data(0, drawing_context.get_vertices());
-
-        let geometry_buffer = self.geometry_buffer.bind(server);
-        geometry_buffer.set_triangles(drawing_context.get_triangles());
+            .set_buffer_data_of_type(0, drawing_context.get_vertices());
+        self.geometry_buffer
+            .set_triangles(drawing_context.get_triangles());
 
         let ortho = Matrix4::new_orthographic(0.0, frame_width, frame_height, 0.0, -1.0, 1.0);
         let resolution = Vector2::new(frame_width, frame_height);
@@ -209,17 +219,16 @@ impl UiRenderer {
                 frame_buffer.clear(viewport, None, None, Some(0));
 
                 self.clipping_geometry_buffer
-                    .set_buffer_data(0, &clipping_geometry.vertex_buffer);
+                    .set_buffer_data_of_type(0, &clipping_geometry.vertex_buffer);
                 self.clipping_geometry_buffer
-                    .bind(server)
                     .set_triangles(&clipping_geometry.triangle_buffer);
 
-                let uniform_buffer = uniform_buffer_cache
-                    .write(server, StaticUniformBuffer::<256>::new().with(&ortho))?;
+                let uniform_buffer =
+                    uniform_buffer_cache.write(StaticUniformBuffer::<256>::new().with(&ortho))?;
 
                 // Draw
                 statistics += frame_buffer.draw(
-                    &self.clipping_geometry_buffer,
+                    &*self.clipping_geometry_buffer,
                     viewport,
                     &*flat_shader.program,
                     &DrawParameters {
@@ -239,6 +248,7 @@ impl UiRenderer {
                         bindings: &[ResourceBinding::Buffer {
                             buffer: uniform_buffer,
                             shader_location: flat_shader.uniform_buffer_binding,
+                            data_usage: Default::default(),
                         }],
                     }],
                     ElementRange::Full,
@@ -366,7 +376,6 @@ impl UiRenderer {
             };
 
             let uniform_buffer = uniform_buffer_cache.write(
-                server,
                 StaticUniformBuffer::<1024>::new()
                     .with(&ortho)
                     .with(&solid_color)
@@ -385,7 +394,7 @@ impl UiRenderer {
 
             let shader = &self.shader;
             statistics += frame_buffer.draw(
-                &self.geometry_buffer,
+                &*self.geometry_buffer,
                 viewport,
                 &*self.shader.program,
                 &params,
@@ -395,6 +404,7 @@ impl UiRenderer {
                         ResourceBinding::Buffer {
                             buffer: uniform_buffer,
                             shader_location: self.shader.uniform_block_index,
+                            data_usage: Default::default(),
                         },
                     ],
                 }],

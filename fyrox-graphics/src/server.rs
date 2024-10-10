@@ -18,14 +18,17 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use crate::gpu_program::{GpuProgram, PropertyDefinition};
+use crate::geometry_buffer::{GeometryBuffer, GeometryBufferDescriptor};
 use crate::{
     buffer::{Buffer, BufferKind, BufferUsage},
     error::FrameworkError,
     framebuffer::{Attachment, FrameBuffer},
+    gpu_program::{GpuProgram, PropertyDefinition},
     gpu_texture::{GpuTexture, GpuTextureKind, MagnificationFilter, MinificationFilter, PixelKind},
     query::Query,
+    read_buffer::AsyncReadBuffer,
     stats::PipelineStatistics,
+    PolygonFace, PolygonFillMode,
 };
 use std::{
     any::Any,
@@ -54,6 +57,8 @@ impl Display for ServerCapabilities {
         Ok(())
     }
 }
+
+pub type SharedGraphicsServer = Rc<dyn GraphicsServer>;
 
 pub trait GraphicsServer: Any {
     fn create_buffer(
@@ -91,6 +96,15 @@ pub trait GraphicsServer: Any {
         fragment_source: &str,
         properties: &[PropertyDefinition],
     ) -> Result<Box<dyn GpuProgram>, FrameworkError>;
+    fn create_async_read_buffer(
+        &self,
+        pixel_size: usize,
+        pixel_count: usize,
+    ) -> Result<Box<dyn AsyncReadBuffer>, FrameworkError>;
+    fn create_geometry_buffer(
+        &self,
+        desc: GeometryBufferDescriptor,
+    ) -> Result<Box<dyn GeometryBuffer>, FrameworkError>;
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn weak(self: Rc<Self>) -> Weak<dyn GraphicsServer>;
@@ -101,4 +115,5 @@ pub trait GraphicsServer: Any {
     fn swap_buffers(&self) -> Result<(), FrameworkError>;
     fn set_frame_size(&self, new_size: (u32, u32));
     fn capabilities(&self) -> ServerCapabilities;
+    fn set_polygon_fill_mode(&self, polygon_face: PolygonFace, polygon_fill_mode: PolygonFillMode);
 }

@@ -43,7 +43,6 @@ use crate::{
                 Attachment, AttachmentKind, FrameBuffer, ResourceBindGroup, ResourceBinding,
             },
             geometry_buffer::GeometryBuffer,
-            gl::server::GlGraphicsServer,
             gpu_program::{GpuProgram, UniformLocation},
             gpu_texture::{
                 Coordinate, GpuTexture, GpuTextureKind, MagnificationFilter, MinificationFilter,
@@ -73,7 +72,7 @@ struct Shader {
 }
 
 impl Shader {
-    fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
+    fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
         let fragment_source = include_str!("../shaders/visibility_fs.glsl");
         let vertex_source = include_str!("../shaders/visibility_vs.glsl");
         let program = server.create_program("VisibilityShader", vertex_source, fragment_source)?;
@@ -96,7 +95,7 @@ pub struct OcclusionTester {
     tile_size: usize,
     w_tiles: usize,
     h_tiles: usize,
-    cube: GeometryBuffer,
+    cube: Box<dyn GeometryBuffer>,
     visibility_buffer_optimizer: VisibilityBufferOptimizer,
     matrix_storage: MatrixStorage,
     objects_to_test: Vec<Handle<Node>>,
@@ -177,7 +176,7 @@ fn inflated_world_aabb(graph: &Graph, object: Handle<Node>) -> Option<AxisAligne
 
 impl OcclusionTester {
     pub fn new(
-        server: &GlGraphicsServer,
+        server: &dyn GraphicsServer,
         width: usize,
         height: usize,
         tile_size: usize,
@@ -238,7 +237,7 @@ impl OcclusionTester {
             w_tiles,
             tile_buffer,
             h_tiles,
-            cube: GeometryBuffer::from_surface_data(
+            cube: <dyn GeometryBuffer>::from_surface_data(
                 &SurfaceData::make_cube(Matrix4::identity()),
                 BufferUsage::StaticDraw,
                 server,
@@ -253,10 +252,8 @@ impl OcclusionTester {
         })
     }
 
-    pub fn try_query_visibility_results(&mut self, server: &GlGraphicsServer, graph: &Graph) {
-        let Some(visibility_buffer) = self
-            .visibility_buffer_optimizer
-            .read_visibility_mask(server)
+    pub fn try_query_visibility_results(&mut self, graph: &Graph) {
+        let Some(visibility_buffer) = self.visibility_buffer_optimizer.read_visibility_mask()
         else {
             return;
         };
@@ -305,7 +302,6 @@ impl OcclusionTester {
 
     fn prepare_tiles(
         &mut self,
-        server: &GlGraphicsServer,
         graph: &Graph,
         viewport: &Rect<i32>,
         debug_renderer: Option<&mut DebugRenderer>,
@@ -354,7 +350,7 @@ impl OcclusionTester {
                 );
             }
 
-            debug_renderer.set_lines(server, &lines);
+            debug_renderer.set_lines(&lines);
         }
 
         self.tile_buffer.borrow_mut().set_data(
@@ -372,7 +368,6 @@ impl OcclusionTester {
 
     fn upload_data<'a>(
         &mut self,
-        server: &GlGraphicsServer,
         graph: &Graph,
         objects_to_test: impl Iterator<Item = &'a Handle<Node>>,
         prev_framebuffer: &dyn FrameBuffer,
@@ -383,8 +378,7 @@ impl OcclusionTester {
         self.observer_position = observer_position;
         let w = self.frame_size.x as i32;
         let h = self.frame_size.y as i32;
-        server.blit_framebuffer(
-            prev_framebuffer,
+        prev_framebuffer.blit_to(
             &*self.framebuffer,
             0,
             0,
@@ -415,10 +409,9 @@ impl OcclusionTester {
 
     pub fn try_run_visibility_test<'a>(
         &mut self,
-        server: &GlGraphicsServer,
         graph: &Graph,
         debug_renderer: Option<&mut DebugRenderer>,
-        unit_quad: &GeometryBuffer,
+        unit_quad: &dyn GeometryBuffer,
         objects_to_test: impl Iterator<Item = &'a Handle<Node>>,
         prev_framebuffer: &dyn FrameBuffer,
         observer_position: Vector3<f32>,
@@ -430,7 +423,6 @@ impl OcclusionTester {
         }
 
         self.upload_data(
-            server,
             graph,
             objects_to_test,
             prev_framebuffer,
@@ -445,7 +437,7 @@ impl OcclusionTester {
         self.framebuffer
             .clear(viewport, Some(Color::TRANSPARENT), None, None);
 
-        self.prepare_tiles(server, graph, &viewport, debug_renderer)?;
+        self.prepare_tiles(graph, &viewport, debug_renderer)?;
 
         self.matrix_storage
             .upload(self.objects_to_test.iter().filter_map(|h| {
@@ -457,7 +449,7 @@ impl OcclusionTester {
         let shader = &self.shader;
         self.framebuffer.draw_instances(
             self.objects_to_test.len(),
-            &self.cube,
+            &*self.cube,
             viewport,
             &*self.shader.program,
             &DrawParameters {
@@ -482,20 +474,19 @@ impl OcclusionTester {
                     ResourceBinding::texture(self.matrix_storage.texture(), &shader.matrices),
                     ResourceBinding::Buffer {
                         buffer: uniform_buffer_cache.write(
-                            server,
                             StaticUniformBuffer::<256>::new()
                                 .with(&self.view_projection)
                                 .with(&(self.tile_size as i32))
                                 .with(&(self.frame_size.y as f32)),
                         )?,
                         shader_location: self.shader.uniform_buffer_binding,
+                        data_usage: Default::default(),
                     },
                 ],
             }],
         );
 
         self.visibility_buffer_optimizer.optimize(
-            server,
             &self.visibility_mask,
             unit_quad,
             self.tile_size as i32,

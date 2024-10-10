@@ -31,7 +31,6 @@ use crate::{
             error::FrameworkError,
             framebuffer::{FrameBuffer, ResourceBindGroup, ResourceBinding},
             geometry_buffer::GeometryBuffer,
-            gl::server::GlGraphicsServer,
             gpu_program::{GpuProgram, UniformLocation},
             gpu_texture::GpuTexture,
             server::GraphicsServer,
@@ -51,7 +50,7 @@ struct FxaaShader {
 }
 
 impl FxaaShader {
-    pub fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
+    pub fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
         let fragment_source = include_str!("shaders/fxaa_fs.glsl");
         let vertex_source = include_str!("shaders/fxaa_vs.glsl");
 
@@ -67,14 +66,14 @@ impl FxaaShader {
 
 pub struct FxaaRenderer {
     shader: FxaaShader,
-    quad: GeometryBuffer,
+    quad: Box<dyn GeometryBuffer>,
 }
 
 impl FxaaRenderer {
-    pub fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
+    pub fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
         Ok(Self {
             shader: FxaaShader::new(server)?,
-            quad: GeometryBuffer::from_surface_data(
+            quad: <dyn GeometryBuffer>::from_surface_data(
                 &SurfaceData::make_unit_xy_quad(),
                 BufferUsage::StaticDraw,
                 server,
@@ -84,7 +83,6 @@ impl FxaaRenderer {
 
     pub(crate) fn render(
         &self,
-        server: &dyn GraphicsServer,
         viewport: Rect<i32>,
         frame_texture: Rc<RefCell<dyn GpuTexture>>,
         frame_buffer: &mut dyn FrameBuffer,
@@ -106,7 +104,7 @@ impl FxaaRenderer {
         ));
 
         statistics += frame_buffer.draw(
-            &self.quad,
+            &*self.quad,
             viewport,
             &*self.shader.program,
             &DrawParameters {
@@ -124,12 +122,12 @@ impl FxaaRenderer {
                     ResourceBinding::texture(&frame_texture, &self.shader.screen_texture),
                     ResourceBinding::Buffer {
                         buffer: uniform_buffer_cache.write(
-                            server,
                             StaticUniformBuffer::<256>::new().with(&frame_matrix).with(
                                 &Vector2::new(1.0 / viewport.w() as f32, 1.0 / viewport.h() as f32),
                             ),
                         )?,
                         shader_location: self.shader.uniform_buffer_binding,
+                        data_usage: Default::default(),
                     },
                 ],
             }],

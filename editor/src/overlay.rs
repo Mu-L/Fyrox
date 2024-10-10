@@ -27,8 +27,8 @@ use crate::{
                 error::FrameworkError,
                 framebuffer::{ResourceBindGroup, ResourceBinding},
                 geometry_buffer::GeometryBuffer,
-                gl::server::GlGraphicsServer,
                 gpu_program::{GpuProgram, UniformLocation},
+                server::GraphicsServer,
                 uniform::StaticUniformBuffer,
                 BlendFactor, BlendFunc, BlendParameters, CompareFunc, DrawParameters, ElementRange,
                 GeometryBufferExt,
@@ -43,7 +43,6 @@ use crate::{
     },
     Editor,
 };
-use fyrox::renderer::framework::server::GraphicsServer;
 use std::{any::TypeId, cell::RefCell, rc::Rc};
 
 struct OverlayShader {
@@ -53,7 +52,7 @@ struct OverlayShader {
 }
 
 impl OverlayShader {
-    pub fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
+    pub fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
         let fragment_source = include_str!("../resources/shaders/overlay_fs.glsl");
         let vertex_source = include_str!("../resources/shaders/overlay_vs.glsl");
         let program = server.create_program("OverlayShader", vertex_source, fragment_source)?;
@@ -67,7 +66,7 @@ impl OverlayShader {
 }
 
 pub struct OverlayRenderPass {
-    quad: GeometryBuffer,
+    quad: Box<dyn GeometryBuffer>,
     shader: OverlayShader,
     sound_icon: TextureResource,
     light_icon: TextureResource,
@@ -75,9 +74,9 @@ pub struct OverlayRenderPass {
 }
 
 impl OverlayRenderPass {
-    pub fn new(server: &GlGraphicsServer) -> Rc<RefCell<Self>> {
+    pub fn new(server: &dyn GraphicsServer) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
-            quad: GeometryBuffer::from_surface_data(
+            quad: <dyn GeometryBuffer>::from_surface_data(
                 &SurfaceData::make_collapsed_xy_quad(),
                 BufferUsage::StaticDraw,
                 server,
@@ -136,7 +135,7 @@ impl SceneRenderPass for OverlayRenderPass {
             let world_matrix = Matrix4::new_translation(&position);
 
             ctx.framebuffer.draw(
-                &self.quad,
+                &*self.quad,
                 ctx.viewport,
                 &*shader.program,
                 &DrawParameters {
@@ -157,7 +156,6 @@ impl SceneRenderPass for OverlayRenderPass {
                         ResourceBinding::texture(&icon, &shader.diffuse_texture),
                         ResourceBinding::Buffer {
                             buffer: ctx.uniform_buffer_cache.write(
-                                ctx.server,
                                 StaticUniformBuffer::<256>::new()
                                     .with(&view_projection)
                                     .with(&world_matrix)
@@ -166,6 +164,7 @@ impl SceneRenderPass for OverlayRenderPass {
                                     .with(&self.pictogram_size),
                             )?,
                             shader_location: shader.uniform_buffer_binding,
+                            data_usage: Default::default(),
                         },
                     ],
                 }],

@@ -42,6 +42,16 @@ pub struct Attachment {
     pub texture: Rc<RefCell<dyn GpuTexture>>,
 }
 
+#[derive(Default)]
+pub enum BufferDataUsage {
+    #[default]
+    UseEverything,
+    UseSegment {
+        offset: usize,
+        size: usize,
+    },
+}
+
 pub enum ResourceBinding<'a> {
     Texture {
         texture: Rc<RefCell<dyn GpuTexture>>,
@@ -50,6 +60,7 @@ pub enum ResourceBinding<'a> {
     Buffer {
         buffer: &'a dyn Buffer,
         shader_location: usize,
+        data_usage: BufferDataUsage,
     },
 }
 
@@ -75,6 +86,21 @@ pub trait FrameBuffer: Any {
     fn color_attachments(&self) -> &[Attachment];
     fn depth_attachment(&self) -> Option<&Attachment>;
     fn set_cubemap_face(&mut self, attachment_index: usize, face: CubeMapFace);
+    fn blit_to(
+        &self,
+        dest: &dyn FrameBuffer,
+        src_x0: i32,
+        src_y0: i32,
+        src_x1: i32,
+        src_y1: i32,
+        dst_x0: i32,
+        dst_y0: i32,
+        dst_x1: i32,
+        dst_y1: i32,
+        copy_color: bool,
+        copy_depth: bool,
+        copy_stencil: bool,
+    );
     fn clear(
         &mut self,
         viewport: Rect<i32>,
@@ -84,7 +110,7 @@ pub trait FrameBuffer: Any {
     );
     fn draw(
         &mut self,
-        geometry: &GeometryBuffer,
+        geometry: &dyn GeometryBuffer,
         viewport: Rect<i32>,
         program: &dyn GpuProgram,
         params: &DrawParameters,
@@ -94,7 +120,7 @@ pub trait FrameBuffer: Any {
     fn draw_instances(
         &mut self,
         count: usize,
-        geometry: &GeometryBuffer,
+        geometry: &dyn GeometryBuffer,
         viewport: Rect<i32>,
         program: &dyn GpuProgram,
         params: &DrawParameters,

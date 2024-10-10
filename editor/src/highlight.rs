@@ -38,7 +38,6 @@ use crate::{
                     Attachment, AttachmentKind, FrameBuffer, ResourceBindGroup, ResourceBinding,
                 },
                 geometry_buffer::GeometryBuffer,
-                gl::server::GlGraphicsServer,
                 gpu_program::{GpuProgram, UniformLocation},
                 gpu_texture::{
                     Coordinate, GpuTextureKind, MagnificationFilter, MinificationFilter, PixelKind,
@@ -64,7 +63,7 @@ struct EdgeDetectShader {
 }
 
 impl EdgeDetectShader {
-    pub fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
+    pub fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
         let fragment_source = r#"
 layout (location = 0) out vec4 outColor;
 
@@ -130,7 +129,7 @@ void main()
 
 pub struct HighlightRenderPass {
     framebuffer: Box<dyn FrameBuffer>,
-    quad: GeometryBuffer,
+    quad: Box<dyn GeometryBuffer>,
     edge_detect_shader: EdgeDetectShader,
     pub scene_handle: Handle<Scene>,
     pub nodes_to_highlight: FxHashSet<Handle<Node>>,
@@ -138,7 +137,7 @@ pub struct HighlightRenderPass {
 
 impl HighlightRenderPass {
     fn create_frame_buffer(
-        server: &GlGraphicsServer,
+        server: &dyn GraphicsServer,
         width: usize,
         height: usize,
     ) -> Box<dyn FrameBuffer> {
@@ -190,10 +189,10 @@ impl HighlightRenderPass {
             .unwrap()
     }
 
-    pub fn new_raw(server: &GlGraphicsServer, width: usize, height: usize) -> Self {
+    pub fn new_raw(server: &dyn GraphicsServer, width: usize, height: usize) -> Self {
         Self {
             framebuffer: Self::create_frame_buffer(server, width, height),
-            quad: GeometryBuffer::from_surface_data(
+            quad: <dyn GeometryBuffer>::from_surface_data(
                 &SurfaceData::make_unit_xy_quad(),
                 BufferUsage::StaticDraw,
                 server,
@@ -205,11 +204,11 @@ impl HighlightRenderPass {
         }
     }
 
-    pub fn new(server: &GlGraphicsServer, width: usize, height: usize) -> Rc<RefCell<Self>> {
+    pub fn new(server: &dyn GraphicsServer, width: usize, height: usize) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self::new_raw(server, width, height)))
     }
 
-    pub fn resize(&mut self, server: &GlGraphicsServer, width: usize, height: usize) {
+    pub fn resize(&mut self, server: &dyn GraphicsServer, width: usize, height: usize) {
         self.framebuffer = Self::create_frame_buffer(server, width, height);
     }
 }
@@ -219,6 +218,8 @@ impl SceneRenderPass for HighlightRenderPass {
         &mut self,
         ctx: SceneRenderPassContext,
     ) -> Result<RenderPassStatistics, FrameworkError> {
+        let mut stats = RenderPassStatistics::default();
+
         if self.scene_handle != ctx.scene_handle {
             return Ok(Default::default());
         }
@@ -263,37 +264,37 @@ impl SceneRenderPass for HighlightRenderPass {
             let camera_up = inv_view.up();
             let camera_side = inv_view.side();
 
-            for bundle in render_bundle_storage.bundles.iter() {
-                bundle.render_to_frame_buffer(
-                    ctx.server,
-                    ctx.geometry_cache,
-                    ctx.shader_cache,
-                    |_| true,
-                    BundleRenderContext {
-                        texture_cache: ctx.texture_cache,
-                        render_pass_name: &render_pass_name,
-                        frame_buffer: &mut *self.framebuffer,
-                        view_projection_matrix: &view_projection,
-                        camera_position: &ctx.camera.global_position(),
-                        camera_up_vector: &camera_up,
-                        camera_side_vector: &camera_side,
-                        z_near: ctx.camera.projection().z_near(),
-                        z_far: ctx.camera.projection().z_far(),
-                        use_pom: false,
-                        light_position: &Default::default(),
-                        normal_dummy: &ctx.normal_dummy,
-                        white_dummy: &ctx.white_dummy,
-                        black_dummy: &ctx.black_dummy,
-                        volume_dummy: &ctx.volume_dummy,
-                        uniform_buffer_cache: ctx.uniform_buffer_cache,
-                        light_data: None,
-                        ambient_light: Default::default(),
-                        scene_depth: Some(&ctx.depth_texture),
-                        viewport: ctx.viewport,
-                        bone_matrices_stub_uniform_buffer: ctx.bone_matrices_stub_uniform_buffer,
-                    },
-                )?;
-            }
+            stats += render_bundle_storage.render_to_frame_buffer(
+                ctx.server,
+                ctx.geometry_cache,
+                ctx.shader_cache,
+                |_| true,
+                |_| true,
+                BundleRenderContext {
+                    texture_cache: ctx.texture_cache,
+                    render_pass_name: &render_pass_name,
+                    frame_buffer: &mut *self.framebuffer,
+                    view_projection_matrix: &view_projection,
+                    camera_position: &ctx.camera.global_position(),
+                    camera_up_vector: &camera_up,
+                    camera_side_vector: &camera_side,
+                    z_near: ctx.camera.projection().z_near(),
+                    z_far: ctx.camera.projection().z_far(),
+                    use_pom: false,
+                    light_position: &Default::default(),
+                    normal_dummy: &ctx.normal_dummy,
+                    white_dummy: &ctx.white_dummy,
+                    black_dummy: &ctx.black_dummy,
+                    volume_dummy: &ctx.volume_dummy,
+                    uniform_buffer_cache: ctx.uniform_buffer_cache,
+                    light_data: None,
+                    ambient_light: Default::default(),
+                    scene_depth: Some(&ctx.depth_texture),
+                    viewport: ctx.viewport,
+                    bone_matrices_stub_uniform_buffer: ctx.bone_matrices_stub_uniform_buffer,
+                    uniform_memory_allocator: ctx.uniform_memory_allocator,
+                },
+            )?;
         }
 
         // Render full screen quad with edge detect shader to draw outline of selected objects.
@@ -313,7 +314,7 @@ impl SceneRenderPass for HighlightRenderPass {
             let shader = &self.edge_detect_shader;
             let frame_texture = self.framebuffer.color_attachments()[0].texture.clone();
             ctx.framebuffer.draw(
-                &self.quad,
+                &*self.quad,
                 ctx.viewport,
                 &*shader.program,
                 &DrawParameters {
@@ -334,12 +335,12 @@ impl SceneRenderPass for HighlightRenderPass {
                         ResourceBinding::texture(&frame_texture, &shader.frame_texture),
                         ResourceBinding::Buffer {
                             buffer: ctx.uniform_buffer_cache.write(
-                                ctx.server,
                                 StaticUniformBuffer::<256>::new()
                                     .with(&frame_matrix)
                                     .with(&Color::ORANGE),
                             )?,
                             shader_location: shader.uniform_buffer_binding,
+                            data_usage: Default::default(),
                         },
                     ],
                 }],

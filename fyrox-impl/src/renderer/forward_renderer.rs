@@ -19,15 +19,7 @@
 // SOFTWARE.
 
 //! Forward renderer is used to render transparent meshes and meshes with custom blending options.
-//!
-//! # Notes
-//!
-//! This renderer eventually will replace deferred renderer, because deferred renderer is too restrictive.
-//! For now it is used **only** to render transparent meshes (or any other mesh that has Forward render
-//! path).
 
-use crate::renderer::bundle::BundleRenderContext;
-use crate::renderer::cache::uniform::UniformBufferCache;
 use crate::{
     core::{
         algebra::{Vector2, Vector4},
@@ -36,11 +28,15 @@ use crate::{
         sstorage::ImmutableString,
     },
     renderer::{
-        bundle::RenderDataBundleStorage,
-        cache::{shader::ShaderCache, texture::TextureCache},
+        bundle::{BundleRenderContext, RenderDataBundleStorage},
+        cache::{
+            shader::ShaderCache,
+            texture::TextureCache,
+            uniform::{UniformBufferCache, UniformMemoryAllocator},
+        },
         framework::{
-            error::FrameworkError, framebuffer::FrameBuffer, gl::server::GlGraphicsServer,
-            gpu_texture::GpuTexture,
+            buffer::Buffer, error::FrameworkError, framebuffer::FrameBuffer,
+            gpu_texture::GpuTexture, server::GraphicsServer,
         },
         GeometryCache, LightData, QualitySettings, RenderPassStatistics,
     },
@@ -51,7 +47,6 @@ use crate::{
         mesh::RenderPath,
     },
 };
-use fyrox_graphics::buffer::Buffer;
 use std::{cell::RefCell, rc::Rc};
 
 pub(crate) struct ForwardRenderer {
@@ -59,7 +54,7 @@ pub(crate) struct ForwardRenderer {
 }
 
 pub(crate) struct ForwardRenderContext<'a, 'b> {
-    pub state: &'a GlGraphicsServer,
+    pub state: &'a dyn GraphicsServer,
     pub graph: &'b Graph,
     pub camera: &'b Camera,
     pub geom_cache: &'a mut GeometryCache,
@@ -77,6 +72,7 @@ pub(crate) struct ForwardRenderContext<'a, 'b> {
     pub uniform_buffer_cache: &'a mut UniformBufferCache,
     pub ambient_light: Color,
     pub bone_matrices_stub_uniform_buffer: &'a dyn Buffer,
+    pub uniform_memory_allocator: &'a mut UniformMemoryAllocator,
 }
 
 impl ForwardRenderer {
@@ -111,6 +107,7 @@ impl ForwardRenderer {
             uniform_buffer_cache,
             ambient_light,
             bone_matrices_stub_uniform_buffer,
+            uniform_memory_allocator,
         } = args;
 
         let view_projection = camera.view_projection_matrix();
@@ -169,41 +166,37 @@ impl ForwardRenderer {
             }
         }
 
-        for bundle in bundle_storage
-            .bundles
-            .iter()
-            .filter(|b| b.render_path == RenderPath::Forward)
-        {
-            statistics += bundle.render_to_frame_buffer(
-                state,
-                geom_cache,
-                shader_cache,
-                |_| true,
-                BundleRenderContext {
-                    texture_cache,
-                    render_pass_name: &self.render_pass_name,
-                    frame_buffer: framebuffer,
-                    viewport,
-                    uniform_buffer_cache,
-                    bone_matrices_stub_uniform_buffer,
-                    view_projection_matrix: &view_projection,
-                    camera_position: &camera.global_position(),
-                    camera_up_vector: &camera_up,
-                    camera_side_vector: &camera_side,
-                    z_near: camera.projection().z_near(),
-                    z_far: camera.projection().z_far(),
-                    use_pom: quality_settings.use_parallax_mapping,
-                    light_position: &Default::default(),
-                    normal_dummy: &normal_dummy,
-                    white_dummy: &white_dummy,
-                    black_dummy: &black_dummy,
-                    volume_dummy: &volume_dummy,
-                    light_data: Some(&light_data),
-                    ambient_light,
-                    scene_depth: Some(&scene_depth),
-                },
-            )?;
-        }
+        statistics += bundle_storage.render_to_frame_buffer(
+            state,
+            geom_cache,
+            shader_cache,
+            |bundle| bundle.render_path == RenderPath::Forward,
+            |_| true,
+            BundleRenderContext {
+                texture_cache,
+                render_pass_name: &self.render_pass_name,
+                frame_buffer: framebuffer,
+                viewport,
+                uniform_buffer_cache,
+                bone_matrices_stub_uniform_buffer,
+                uniform_memory_allocator,
+                view_projection_matrix: &view_projection,
+                camera_position: &camera.global_position(),
+                camera_up_vector: &camera_up,
+                camera_side_vector: &camera_side,
+                z_near: camera.projection().z_near(),
+                z_far: camera.projection().z_far(),
+                use_pom: quality_settings.use_parallax_mapping,
+                light_position: &Default::default(),
+                normal_dummy: &normal_dummy,
+                white_dummy: &white_dummy,
+                black_dummy: &black_dummy,
+                volume_dummy: &volume_dummy,
+                light_data: Some(&light_data),
+                ambient_light,
+                scene_depth: Some(&scene_depth),
+            },
+        )?;
 
         Ok(statistics)
     }

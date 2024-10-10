@@ -18,7 +18,6 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use crate::renderer::cache::uniform::UniformBufferCache;
 use crate::{
     core::{
         algebra::{Matrix3, Matrix4, Vector2, Vector3},
@@ -28,12 +27,14 @@ use crate::{
     },
     rand::Rng,
     renderer::{
+        cache::uniform::UniformBufferCache,
         framework::{
             buffer::BufferUsage,
             error::FrameworkError,
-            framebuffer::{Attachment, AttachmentKind, FrameBuffer},
+            framebuffer::{
+                Attachment, AttachmentKind, FrameBuffer, ResourceBindGroup, ResourceBinding,
+            },
             geometry_buffer::GeometryBuffer,
-            gl::server::GlGraphicsServer,
             gpu_program::{GpuProgram, UniformLocation},
             gpu_texture::{
                 Coordinate, GpuTexture, GpuTextureKind, MagnificationFilter, MinificationFilter,
@@ -49,7 +50,6 @@ use crate::{
     },
     scene::mesh::surface::SurfaceData,
 };
-use fyrox_graphics::framebuffer::{ResourceBindGroup, ResourceBinding};
 use std::{cell::RefCell, rc::Rc};
 
 mod blur;
@@ -69,7 +69,7 @@ struct Shader {
 }
 
 impl Shader {
-    pub fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
+    pub fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
         let fragment_source = include_str!("../shaders/ssao_fs.glsl");
         let vertex_source = include_str!("../shaders/ssao_vs.glsl");
         let program = server.create_program("SsaoShader", vertex_source, fragment_source)?;
@@ -87,7 +87,7 @@ pub struct ScreenSpaceAmbientOcclusionRenderer {
     blur: Blur,
     shader: Shader,
     framebuffer: Box<dyn FrameBuffer>,
-    quad: GeometryBuffer,
+    quad: Box<dyn GeometryBuffer>,
     width: i32,
     height: i32,
     noise: Rc<RefCell<dyn GpuTexture>>,
@@ -97,7 +97,7 @@ pub struct ScreenSpaceAmbientOcclusionRenderer {
 
 impl ScreenSpaceAmbientOcclusionRenderer {
     pub fn new(
-        server: &GlGraphicsServer,
+        server: &dyn GraphicsServer,
         frame_width: usize,
         frame_height: usize,
     ) -> Result<Self, FrameworkError> {
@@ -127,7 +127,7 @@ impl ScreenSpaceAmbientOcclusionRenderer {
                     texture: occlusion,
                 }],
             )?,
-            quad: GeometryBuffer::from_surface_data(
+            quad: <dyn GeometryBuffer>::from_surface_data(
                 &SurfaceData::make_unit_xy_quad(),
                 BufferUsage::StaticDraw,
                 server,
@@ -198,7 +198,6 @@ impl ScreenSpaceAmbientOcclusionRenderer {
 
     pub(crate) fn render(
         &mut self,
-        server: &dyn GraphicsServer,
         gbuffer: &GBuffer,
         projection_matrix: Matrix4<f32>,
         view_matrix: Matrix3<f32>,
@@ -234,7 +233,6 @@ impl ScreenSpaceAmbientOcclusionRenderer {
         );
 
         let uniform_buffer = uniform_buffer_cache.write(
-            server,
             StaticUniformBuffer::<1024>::new()
                 .with(&frame_matrix)
                 .with(&projection_matrix.try_inverse().unwrap_or_default())
@@ -246,7 +244,7 @@ impl ScreenSpaceAmbientOcclusionRenderer {
         )?;
 
         stats += self.framebuffer.draw(
-            &self.quad,
+            &*self.quad,
             viewport,
             &*self.shader.program,
             &DrawParameters {
@@ -270,14 +268,14 @@ impl ScreenSpaceAmbientOcclusionRenderer {
                     ResourceBinding::Buffer {
                         buffer: uniform_buffer,
                         shader_location: self.shader.uniform_block_index,
+                        data_usage: Default::default(),
                     },
                 ],
             }],
             ElementRange::Full,
         )?;
 
-        self.blur
-            .render(server, self.raw_ao_map(), uniform_buffer_cache)?;
+        self.blur.render(self.raw_ao_map(), uniform_buffer_cache)?;
 
         Ok(stats)
     }

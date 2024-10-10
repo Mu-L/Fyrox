@@ -37,10 +37,9 @@ use crate::{
             error::FrameworkError,
             framebuffer::{FrameBuffer, ResourceBindGroup, ResourceBinding},
             geometry_buffer::{
-                AttributeDefinition, AttributeKind, BufferBuilder, GeometryBuffer,
-                GeometryBufferBuilder,
+                AttributeDefinition, AttributeKind, GeometryBuffer, GeometryBufferDescriptor,
+                VertexBufferData, VertexBufferDescriptor,
             },
-            gl::server::GlGraphicsServer,
             gpu_program::GpuProgram,
             server::GraphicsServer,
             uniform::StaticUniformBuffer,
@@ -61,7 +60,7 @@ struct Vertex {
 
 /// See module docs.
 pub struct DebugRenderer {
-    geometry: GeometryBuffer,
+    geometry: Box<dyn GeometryBuffer>,
     vertices: Vec<Vertex>,
     line_indices: Vec<[u32; 2]>,
     shader: DebugShader,
@@ -89,7 +88,7 @@ pub fn draw_rect(rect: &Rect<f32>, lines: &mut Vec<Line>, color: Color) {
 }
 
 impl DebugShader {
-    fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
+    fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
         let fragment_source = include_str!("shaders/debug_fs.glsl");
         let vertex_source = include_str!("shaders/debug_vs.glsl");
         let program = server.create_program("DebugShader", vertex_source, fragment_source)?;
@@ -102,27 +101,33 @@ impl DebugShader {
 }
 
 impl DebugRenderer {
-    pub(crate) fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
-        let geometry = GeometryBufferBuilder::new(ElementKind::Line)
-            .with_buffer_builder(
-                BufferBuilder::new::<Vertex>(BufferUsage::DynamicDraw, None)
-                    .with_attribute(AttributeDefinition {
+    pub(crate) fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
+        let desc = GeometryBufferDescriptor {
+            element_kind: ElementKind::Line,
+            buffers: &[VertexBufferDescriptor {
+                usage: BufferUsage::DynamicDraw,
+                attributes: &[
+                    AttributeDefinition {
                         location: 0,
                         divisor: 0,
-                        kind: AttributeKind::Float3,
+                        kind: AttributeKind::Float,
+                        component_count: 3,
                         normalized: false,
-                    })
-                    .with_attribute(AttributeDefinition {
+                    },
+                    AttributeDefinition {
                         location: 1,
-                        kind: AttributeKind::UnsignedByte4,
+                        kind: AttributeKind::UnsignedByte,
+                        component_count: 4,
                         normalized: true,
                         divisor: 0,
-                    }),
-            )
-            .build(server)?;
+                    },
+                ],
+                data: VertexBufferData::new::<Vertex>(None),
+            }],
+        };
 
         Ok(Self {
-            geometry,
+            geometry: server.create_geometry_buffer(desc)?,
             shader: DebugShader::new(server)?,
             vertices: Default::default(),
             line_indices: Default::default(),
@@ -130,7 +135,7 @@ impl DebugRenderer {
     }
 
     /// Uploads the new set of lines to GPU.
-    pub fn set_lines(&mut self, server: &GlGraphicsServer, lines: &[Line]) {
+    pub fn set_lines(&mut self, lines: &[Line]) {
         self.vertices.clear();
         self.line_indices.clear();
 
@@ -148,13 +153,12 @@ impl DebugRenderer {
             self.line_indices.push([i, i + 1]);
             i += 2;
         }
-        self.geometry.set_buffer_data(0, &self.vertices);
-        self.geometry.bind(server).set_lines(&self.line_indices);
+        self.geometry.set_buffer_data_of_type(0, &self.vertices);
+        self.geometry.set_lines(&self.line_indices);
     }
 
     pub(crate) fn render(
         &mut self,
-        server: &dyn GraphicsServer,
         uniform_buffer_cache: &mut UniformBufferCache,
         viewport: Rect<i32>,
         framebuffer: &mut dyn FrameBuffer,
@@ -162,13 +166,11 @@ impl DebugRenderer {
     ) -> Result<RenderPassStatistics, FrameworkError> {
         let mut statistics = RenderPassStatistics::default();
 
-        let uniform_buffer = uniform_buffer_cache.write(
-            server,
-            StaticUniformBuffer::<256>::new().with(&view_projection),
-        )?;
+        let uniform_buffer =
+            uniform_buffer_cache.write(StaticUniformBuffer::<256>::new().with(&view_projection))?;
 
         statistics += framebuffer.draw(
-            &self.geometry,
+            &*self.geometry,
             viewport,
             &*self.shader.program,
             &DrawParameters {
@@ -185,6 +187,7 @@ impl DebugRenderer {
                 bindings: &[ResourceBinding::Buffer {
                     buffer: uniform_buffer,
                     shader_location: self.shader.uniform_buffer_binding,
+                    data_usage: Default::default(),
                 }],
             }],
             ElementRange::Full,

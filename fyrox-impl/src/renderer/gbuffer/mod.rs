@@ -29,8 +29,6 @@
 //! Every alpha channel is used for layer blending for terrains. This is inefficient, but for
 //! now I don't know better solution.
 
-use crate::renderer::cache::uniform::UniformBufferCache;
-use crate::renderer::framework::GeometryBufferExt;
 use crate::{
     core::{
         algebra::{Matrix4, Vector2},
@@ -40,18 +38,26 @@ use crate::{
     },
     renderer::{
         bundle::{BundleRenderContext, RenderDataBundleStorage, SurfaceInstanceData},
-        cache::shader::ShaderCache,
+        cache::{
+            shader::ShaderCache,
+            uniform::{UniformBufferCache, UniformMemoryAllocator},
+        },
         debug_renderer::DebugRenderer,
         framework::{
+            buffer::{Buffer, BufferUsage},
             error::FrameworkError,
-            framebuffer::{Attachment, AttachmentKind, FrameBuffer},
+            framebuffer::{
+                Attachment, AttachmentKind, FrameBuffer, ResourceBindGroup, ResourceBinding,
+            },
             geometry_buffer::GeometryBuffer,
-            gl::server::GlGraphicsServer,
             gpu_texture::{
                 Coordinate, GpuTexture, GpuTextureKind, MagnificationFilter, MinificationFilter,
                 PixelKind, WrapMode,
             },
+            server::GraphicsServer,
+            uniform::StaticUniformBuffer,
             BlendFactor, BlendFunc, BlendParameters, DrawParameters, ElementRange,
+            GeometryBufferExt,
         },
         gbuffer::decal::DecalShader,
         occlusion::OcclusionTester,
@@ -65,10 +71,6 @@ use crate::{
     },
 };
 use fxhash::FxHashSet;
-use fyrox_graphics::buffer::{Buffer, BufferUsage};
-use fyrox_graphics::framebuffer::{ResourceBindGroup, ResourceBinding};
-use fyrox_graphics::server::GraphicsServer;
-use fyrox_graphics::uniform::StaticUniformBuffer;
 use std::{cell::RefCell, rc::Rc};
 
 mod decal;
@@ -78,14 +80,14 @@ pub struct GBuffer {
     decal_framebuffer: Box<dyn FrameBuffer>,
     pub width: i32,
     pub height: i32,
-    cube: GeometryBuffer,
+    cube: Box<dyn GeometryBuffer>,
     decal_shader: DecalShader,
     render_pass_name: ImmutableString,
     occlusion_tester: OcclusionTester,
 }
 
 pub(crate) struct GBufferRenderContext<'a, 'b> {
-    pub server: &'a GlGraphicsServer,
+    pub server: &'a dyn GraphicsServer,
     pub camera: &'b Camera,
     pub geom_cache: &'a mut GeometryCache,
     pub bundle_storage: &'a RenderDataBundleStorage,
@@ -99,14 +101,15 @@ pub(crate) struct GBufferRenderContext<'a, 'b> {
     pub graph: &'b Graph,
     pub uniform_buffer_cache: &'a mut UniformBufferCache,
     pub bone_matrices_stub_uniform_buffer: &'a dyn Buffer,
+    pub uniform_memory_allocator: &'a mut UniformMemoryAllocator,
     #[allow(dead_code)]
     pub screen_space_debug_renderer: &'a mut DebugRenderer,
-    pub unit_quad: &'a GeometryBuffer,
+    pub unit_quad: &'a dyn GeometryBuffer,
 }
 
 impl GBuffer {
     pub fn new(
-        server: &GlGraphicsServer,
+        server: &dyn GraphicsServer,
         width: usize,
         height: usize,
     ) -> Result<Self, FrameworkError> {
@@ -248,7 +251,7 @@ impl GBuffer {
             width: width as i32,
             height: height as i32,
             decal_shader: DecalShader::new(server)?,
-            cube: GeometryBuffer::from_surface_data(
+            cube: <dyn GeometryBuffer>::from_surface_data(
                 &SurfaceData::make_cube(Matrix4::identity()),
                 BufferUsage::StaticDraw,
                 server,
@@ -309,14 +312,14 @@ impl GBuffer {
             uniform_buffer_cache,
             unit_quad,
             bone_matrices_stub_uniform_buffer,
+            uniform_memory_allocator,
             ..
         } = args;
 
         let view_projection = camera.view_projection_matrix();
 
         if quality_settings.use_occlusion_culling {
-            self.occlusion_tester
-                .try_query_visibility_results(server, graph);
+            self.occlusion_tester.try_query_visibility_results(graph);
         };
 
         let viewport = Rect::new(0, 0, self.width, self.height);
@@ -342,41 +345,37 @@ impl GBuffer {
                 || grid_cell.map_or(true, |cell| cell.is_visible(instance.node_handle))
         };
 
-        for bundle in bundle_storage
-            .bundles
-            .iter()
-            .filter(|b| b.render_path == RenderPath::Deferred)
-        {
-            statistics += bundle.render_to_frame_buffer(
-                server,
-                geom_cache,
-                shader_cache,
-                instance_filter,
-                BundleRenderContext {
-                    texture_cache,
-                    render_pass_name: &self.render_pass_name,
-                    frame_buffer: &mut *self.framebuffer,
-                    viewport,
-                    uniform_buffer_cache,
-                    bone_matrices_stub_uniform_buffer,
-                    view_projection_matrix: &view_projection,
-                    camera_position: &camera.global_position(),
-                    camera_up_vector: &camera_up,
-                    camera_side_vector: &camera_side,
-                    z_near: camera.projection().z_near(),
-                    use_pom: quality_settings.use_parallax_mapping,
-                    light_position: &Default::default(),
-                    normal_dummy: &normal_dummy,
-                    white_dummy: &white_dummy,
-                    black_dummy: &black_dummy,
-                    volume_dummy: &volume_dummy,
-                    light_data: None,
-                    ambient_light: Color::WHITE, // TODO
-                    scene_depth: None,           // TODO. Add z-pre-pass.
-                    z_far: camera.projection().z_far(),
-                },
-            )?;
-        }
+        statistics += bundle_storage.render_to_frame_buffer(
+            server,
+            geom_cache,
+            shader_cache,
+            |bundle| bundle.render_path == RenderPath::Deferred,
+            instance_filter,
+            BundleRenderContext {
+                texture_cache,
+                render_pass_name: &self.render_pass_name,
+                frame_buffer: &mut *self.framebuffer,
+                viewport,
+                uniform_buffer_cache,
+                bone_matrices_stub_uniform_buffer,
+                uniform_memory_allocator,
+                view_projection_matrix: &view_projection,
+                camera_position: &camera.global_position(),
+                camera_up_vector: &camera_up,
+                camera_side_vector: &camera_side,
+                z_near: camera.projection().z_near(),
+                use_pom: quality_settings.use_parallax_mapping,
+                light_position: &Default::default(),
+                normal_dummy: &normal_dummy,
+                white_dummy: &white_dummy,
+                black_dummy: &black_dummy,
+                volume_dummy: &volume_dummy,
+                light_data: None,
+                ambient_light: Color::WHITE, // TODO
+                scene_depth: None,           // TODO. Add z-pre-pass.
+                z_far: camera.projection().z_far(),
+            },
+        )?;
 
         if quality_settings.use_occlusion_culling {
             let mut objects = FxHashSet::default();
@@ -387,7 +386,6 @@ impl GBuffer {
             }
 
             self.occlusion_tester.try_run_visibility_test(
-                server,
                 graph,
                 None,
                 unit_quad,
@@ -427,7 +425,7 @@ impl GBuffer {
                 .clone();
 
             statistics += self.decal_framebuffer.draw(
-                unit_cube,
+                &**unit_cube,
                 viewport,
                 program,
                 &DrawParameters {
@@ -451,7 +449,6 @@ impl GBuffer {
                         ResourceBinding::texture(&decal_mask, &shader.decal_mask),
                         ResourceBinding::Buffer {
                             buffer: uniform_buffer_cache.write(
-                                server,
                                 StaticUniformBuffer::<256>::new()
                                     .with(&world_view_proj)
                                     .with(&inv_view_proj)
@@ -463,6 +460,7 @@ impl GBuffer {
                                     .with(&(decal.layer() as u32)),
                             )?,
                             shader_location: shader.uniform_buffer_binding,
+                            data_usage: Default::default(),
                         },
                     ],
                 }],

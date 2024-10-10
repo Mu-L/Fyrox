@@ -26,11 +26,18 @@ use crate::{
     },
     graph::SceneGraph,
     renderer::{
-        cache::{shader::ShaderCache, uniform::UniformBufferCache},
+        cache::{
+            shader::ShaderCache, uniform::UniformBufferCache, uniform::UniformMemoryAllocator,
+        },
         flat_shader::FlatShader,
         framework::{
-            buffer::BufferUsage, error::FrameworkError, framebuffer::FrameBuffer,
-            geometry_buffer::GeometryBuffer, gl::server::GlGraphicsServer, gpu_texture::GpuTexture,
+            buffer::{Buffer, BufferUsage},
+            error::FrameworkError,
+            framebuffer::{FrameBuffer, ResourceBindGroup, ResourceBinding},
+            geometry_buffer::GeometryBuffer,
+            gpu_texture::GpuTexture,
+            server::GraphicsServer,
+            uniform::StaticUniformBuffer,
             BlendFactor, BlendFunc, BlendParameters, ColorMask, CompareFunc, CullFace,
             DrawParameters, ElementRange, GeometryBufferExt, StencilAction, StencilFunc, StencilOp,
         },
@@ -61,9 +68,6 @@ use crate::{
         Scene,
     },
 };
-use fyrox_graphics::buffer::Buffer;
-use fyrox_graphics::framebuffer::{ResourceBindGroup, ResourceBinding};
-use fyrox_graphics::uniform::StaticUniformBuffer;
 use std::{cell::RefCell, rc::Rc};
 
 pub mod ambient;
@@ -77,10 +81,10 @@ pub struct DeferredLightRenderer {
     point_light_shader: PointLightShader,
     directional_light_shader: DirectionalLightShader,
     ambient_light_shader: AmbientLightShader,
-    quad: GeometryBuffer,
-    sphere: GeometryBuffer,
-    cone: GeometryBuffer,
-    skybox: GeometryBuffer,
+    quad: Box<dyn GeometryBuffer>,
+    sphere: Box<dyn GeometryBuffer>,
+    cone: Box<dyn GeometryBuffer>,
+    skybox: Box<dyn GeometryBuffer>,
     flat_shader: FlatShader,
     skybox_shader: SkyboxShader,
     spot_shadow_map_renderer: SpotShadowMapRenderer,
@@ -90,7 +94,7 @@ pub struct DeferredLightRenderer {
 }
 
 pub(crate) struct DeferredRendererContext<'a> {
-    pub server: &'a GlGraphicsServer,
+    pub server: &'a dyn GraphicsServer,
     pub scene: &'a Scene,
     pub camera: &'a Camera,
     pub gbuffer: &'a mut GBuffer,
@@ -107,11 +111,12 @@ pub(crate) struct DeferredRendererContext<'a> {
     pub uniform_buffer_cache: &'a mut UniformBufferCache,
     pub visibility_cache: &'a mut ObserverVisibilityCache,
     pub bone_matrices_stub_uniform_buffer: &'a dyn Buffer,
+    pub uniform_memory_allocator: &'a mut UniformMemoryAllocator,
 }
 
 impl DeferredLightRenderer {
     pub fn new(
-        server: &GlGraphicsServer,
+        server: &dyn GraphicsServer,
         frame_size: (u32, u32),
         settings: &QualitySettings,
     ) -> Result<Self, FrameworkError> {
@@ -160,12 +165,12 @@ impl DeferredLightRenderer {
             point_light_shader: PointLightShader::new(server)?,
             directional_light_shader: DirectionalLightShader::new(server)?,
             ambient_light_shader: AmbientLightShader::new(server)?,
-            quad: GeometryBuffer::from_surface_data(
+            quad: <dyn GeometryBuffer>::from_surface_data(
                 &SurfaceData::make_unit_xy_quad(),
                 BufferUsage::StaticDraw,
                 server,
             )?,
-            skybox: GeometryBuffer::from_surface_data(
+            skybox: <dyn GeometryBuffer>::from_surface_data(
                 &SurfaceData::new(
                     VertexBuffer::new(vertices.len(), vertices).unwrap(),
                     TriangleBuffer::new(vec![
@@ -186,12 +191,12 @@ impl DeferredLightRenderer {
                 BufferUsage::StaticDraw,
                 server,
             )?,
-            sphere: GeometryBuffer::from_surface_data(
+            sphere: <dyn GeometryBuffer>::from_surface_data(
                 &SurfaceData::make_sphere(6, 6, 1.0, &Matrix4::identity()),
                 BufferUsage::StaticDraw,
                 server,
             )?,
-            cone: GeometryBuffer::from_surface_data(
+            cone: <dyn GeometryBuffer>::from_surface_data(
                 &SurfaceData::make_cone(
                     16,
                     0.5,
@@ -224,7 +229,7 @@ impl DeferredLightRenderer {
 
     pub fn set_quality_settings(
         &mut self,
-        server: &GlGraphicsServer,
+        server: &dyn GraphicsServer,
         settings: &QualitySettings,
     ) -> Result<(), FrameworkError> {
         if settings.spot_shadow_map_size != self.spot_shadow_map_renderer.base_size()
@@ -260,7 +265,7 @@ impl DeferredLightRenderer {
 
     pub fn set_frame_size(
         &mut self,
-        server: &GlGraphicsServer,
+        server: &dyn GraphicsServer,
         frame_size: (u32, u32),
     ) -> Result<(), FrameworkError> {
         self.ssao_renderer = ScreenSpaceAmbientOcclusionRenderer::new(
@@ -296,6 +301,7 @@ impl DeferredLightRenderer {
             uniform_buffer_cache,
             visibility_cache,
             bone_matrices_stub_uniform_buffer,
+            uniform_memory_allocator,
         } = args;
 
         let viewport = Rect::new(0, 0, gbuffer.width, gbuffer.height);
@@ -324,7 +330,6 @@ impl DeferredLightRenderer {
         // Fill SSAO map.
         if settings.use_ssao {
             pass_stats += self.ssao_renderer.render(
-                server,
                 gbuffer,
                 projection_matrix,
                 camera.view_matrix().basis(),
@@ -344,7 +349,7 @@ impl DeferredLightRenderer {
             {
                 let shader = &self.skybox_shader;
                 pass_stats += frame_buffer.draw(
-                    &self.skybox,
+                    &*self.skybox,
                     viewport,
                     &*shader.program,
                     &DrawParameters {
@@ -362,11 +367,11 @@ impl DeferredLightRenderer {
                             ResourceBinding::texture(gpu_texture, &shader.cubemap_texture),
                             ResourceBinding::Buffer {
                                 buffer: uniform_buffer_cache.write(
-                                    server,
                                     StaticUniformBuffer::<256>::new()
                                         .with(&(view_projection * wvp)),
                                 )?,
                                 shader_location: shader.uniform_buffer_binding,
+                                data_usage: Default::default(),
                             },
                         ],
                     }],
@@ -387,7 +392,7 @@ impl DeferredLightRenderer {
         let ao_map = self.ssao_renderer.ao_map();
 
         pass_stats += frame_buffer.draw(
-            &self.quad,
+            &*self.quad,
             viewport,
             &*self.ambient_light_shader.program,
             &DrawParameters {
@@ -423,12 +428,12 @@ impl DeferredLightRenderer {
                     ),
                     ResourceBinding::Buffer {
                         buffer: uniform_buffer_cache.write(
-                            server,
                             StaticUniformBuffer::<256>::new()
                                 .with(&frame_matrix)
                                 .with(&ambient_color.srgb_to_linear_f32()),
                         )?,
                         shader_location: self.ambient_light_shader.uniform_buffer_binding,
+                        data_usage: Default::default(),
                     },
                 ],
             }],
@@ -540,12 +545,11 @@ impl DeferredLightRenderer {
 
             // Mark lighted areas in stencil buffer to do light calculations only on them.
             let uniform_buffer = uniform_buffer_cache.write(
-                server,
                 StaticUniformBuffer::<256>::new().with(&(view_projection * bounding_shape_matrix)),
             )?;
 
             pass_stats += frame_buffer.draw(
-                bounding_shape,
+                &**bounding_shape,
                 viewport,
                 &*self.flat_shader.program,
                 &DrawParameters {
@@ -568,13 +572,14 @@ impl DeferredLightRenderer {
                     bindings: &[ResourceBinding::Buffer {
                         buffer: uniform_buffer,
                         shader_location: self.flat_shader.uniform_buffer_binding,
+                        data_usage: Default::default(),
                     }],
                 }],
                 ElementRange::Full,
             )?;
 
             pass_stats += frame_buffer.draw(
-                bounding_shape,
+                &**bounding_shape,
                 viewport,
                 &*self.flat_shader.program,
                 &DrawParameters {
@@ -597,6 +602,7 @@ impl DeferredLightRenderer {
                     bindings: &[ResourceBinding::Buffer {
                         buffer: uniform_buffer,
                         shader_location: self.flat_shader.uniform_buffer_binding,
+                        data_usage: Default::default(),
                     }],
                 }],
                 ElementRange::Full,
@@ -611,14 +617,12 @@ impl DeferredLightRenderer {
                 if visibility_cache.needs_occlusion_query(camera_global_position, light_handle) {
                     // Draw full screen quad, that will be used to count pixels that passed the stencil test
                     // on the stencil buffer's content generated by two previous drawing commands.
-                    let uniform_buffer = uniform_buffer_cache.write(
-                        server,
-                        StaticUniformBuffer::<256>::new().with(&frame_matrix),
-                    )?;
+                    let uniform_buffer = uniform_buffer_cache
+                        .write(StaticUniformBuffer::<256>::new().with(&frame_matrix))?;
 
                     visibility_cache.begin_query(server, camera_global_position, light_handle)?;
                     frame_buffer.draw(
-                        &self.quad,
+                        &*self.quad,
                         viewport,
                         &*self.flat_shader.program,
                         &DrawParameters {
@@ -638,6 +642,7 @@ impl DeferredLightRenderer {
                             bindings: &[ResourceBinding::Buffer {
                                 buffer: uniform_buffer,
                                 shader_location: self.flat_shader.uniform_buffer_binding,
+                                data_usage: Default::default(),
                             }],
                         }],
                         ElementRange::Full,
@@ -690,6 +695,7 @@ impl DeferredLightRenderer {
                         volume_dummy.clone(),
                         uniform_buffer_cache,
                         bone_matrices_stub_uniform_buffer,
+                        uniform_memory_allocator,
                     )?;
 
                     light_stats.spot_shadow_maps_rendered += 1;
@@ -711,6 +717,7 @@ impl DeferredLightRenderer {
                                 volume_dummy: volume_dummy.clone(),
                                 uniform_buffer_cache,
                                 bone_matrices_stub_uniform_buffer,
+                                uniform_memory_allocator,
                             })?;
 
                     light_stats.point_shadow_maps_rendered += 1;
@@ -730,6 +737,7 @@ impl DeferredLightRenderer {
                         volume_dummy: volume_dummy.clone(),
                         uniform_buffer_cache,
                         bone_matrices_stub_uniform_buffer,
+                        uniform_memory_allocator,
                     })?;
 
                     light_stats.csm_rendered += 1;
@@ -778,7 +786,6 @@ impl DeferredLightRenderer {
                     let inv_size =
                         1.0 / (self.spot_shadow_map_renderer.cascade_size(cascade_index) as f32);
                     let uniform_buffer = uniform_buffer_cache.write(
-                        server,
                         StaticUniformBuffer::<1024>::new()
                             .with(&frame_matrix)
                             .with(&light_view_projection)
@@ -800,7 +807,7 @@ impl DeferredLightRenderer {
                     )?;
 
                     frame_buffer.draw(
-                        quad,
+                        &**quad,
                         viewport,
                         &*shader.program,
                         &draw_params,
@@ -827,6 +834,7 @@ impl DeferredLightRenderer {
                                 ResourceBinding::Buffer {
                                     buffer: uniform_buffer,
                                     shader_location: shader.uniform_buffer_binding,
+                                    data_usage: Default::default(),
                                 },
                             ],
                         }],
@@ -838,7 +846,6 @@ impl DeferredLightRenderer {
                     light_stats.point_lights_rendered += 1;
 
                     let uniform_buffer = uniform_buffer_cache.write(
-                        server,
                         StaticUniformBuffer::<1024>::new()
                             .with(&frame_matrix)
                             .with(&inv_view_projection)
@@ -854,7 +861,7 @@ impl DeferredLightRenderer {
                     )?;
 
                     frame_buffer.draw(
-                        quad,
+                        &**quad,
                         viewport,
                         &*shader.program,
                         &draw_params,
@@ -882,6 +889,7 @@ impl DeferredLightRenderer {
                                 ResourceBinding::Buffer {
                                     buffer: uniform_buffer,
                                     shader_location: shader.uniform_buffer_binding,
+                                    data_usage: Default::default(),
                                 },
                             ],
                         }],
@@ -904,7 +912,6 @@ impl DeferredLightRenderer {
                     ];
 
                     let uniform_buffer = uniform_buffer_cache.write(
-                        server,
                         StaticUniformBuffer::<1024>::new()
                             .with(&frame_matrix)
                             .with(&camera.view_matrix())
@@ -922,7 +929,7 @@ impl DeferredLightRenderer {
                     )?;
 
                     frame_buffer.draw(
-                        quad,
+                        &**quad,
                         viewport,
                         &*shader.program,
                         &DrawParameters {
@@ -968,6 +975,7 @@ impl DeferredLightRenderer {
                                 ResourceBinding::Buffer {
                                     buffer: uniform_buffer,
                                     shader_location: shader.uniform_buffer_binding,
+                                    data_usage: Default::default(),
                                 },
                             ],
                         }],
@@ -982,11 +990,10 @@ impl DeferredLightRenderer {
             // light source.
             if settings.light_scatter_enabled {
                 pass_stats += self.light_volume.render_volume(
-                    server,
                     light,
                     light_handle,
                     gbuffer,
-                    &self.quad,
+                    &*self.quad,
                     camera.view_matrix(),
                     inv_projection,
                     view_projection,

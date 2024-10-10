@@ -33,7 +33,6 @@ use crate::{
             error::FrameworkError,
             framebuffer::{FrameBuffer, ResourceBindGroup, ResourceBinding},
             geometry_buffer::GeometryBuffer,
-            gl::server::GlGraphicsServer,
             gpu_program::{GpuProgram, UniformLocation},
             server::GraphicsServer,
             uniform::StaticUniformBuffer,
@@ -58,7 +57,7 @@ struct SpotLightShader {
 }
 
 impl SpotLightShader {
-    fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
+    fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
         let fragment_source = include_str!("shaders/spot_volumetric_fs.glsl");
         let vertex_source = include_str!("shaders/spot_volumetric_vs.glsl");
         let program =
@@ -79,7 +78,7 @@ struct PointLightShader {
 }
 
 impl PointLightShader {
-    fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
+    fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
         let fragment_source = include_str!("shaders/point_volumetric_fs.glsl");
         let vertex_source = include_str!("shaders/point_volumetric_vs.glsl");
         let program =
@@ -97,17 +96,17 @@ pub struct LightVolumeRenderer {
     spot_light_shader: SpotLightShader,
     point_light_shader: PointLightShader,
     flat_shader: FlatShader,
-    cone: GeometryBuffer,
-    sphere: GeometryBuffer,
+    cone: Box<dyn GeometryBuffer>,
+    sphere: Box<dyn GeometryBuffer>,
 }
 
 impl LightVolumeRenderer {
-    pub fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
+    pub fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
         Ok(Self {
             spot_light_shader: SpotLightShader::new(server)?,
             point_light_shader: PointLightShader::new(server)?,
             flat_shader: FlatShader::new(server)?,
-            cone: GeometryBuffer::from_surface_data(
+            cone: <dyn GeometryBuffer>::from_surface_data(
                 &SurfaceData::make_cone(
                     16,
                     1.0,
@@ -117,7 +116,7 @@ impl LightVolumeRenderer {
                 BufferUsage::StaticDraw,
                 server,
             )?,
-            sphere: GeometryBuffer::from_surface_data(
+            sphere: <dyn GeometryBuffer>::from_surface_data(
                 &SurfaceData::make_sphere(8, 8, 1.0, &Matrix4::identity()),
                 BufferUsage::StaticDraw,
                 server,
@@ -128,11 +127,10 @@ impl LightVolumeRenderer {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_volume(
         &mut self,
-        server: &dyn GraphicsServer,
         light: &Node,
         light_handle: Handle<Node>,
         gbuffer: &mut GBuffer,
-        quad: &GeometryBuffer,
+        quad: &dyn GeometryBuffer,
         view: Matrix4<f32>,
         inv_proj: Matrix4<f32>,
         view_proj: Matrix4<f32>,
@@ -191,7 +189,7 @@ impl LightVolumeRenderer {
             frame_buffer.clear(viewport, None, None, Some(0));
 
             stats += frame_buffer.draw(
-                &self.cone,
+                &*self.cone,
                 viewport,
                 &*self.flat_shader.program,
                 &DrawParameters {
@@ -216,8 +214,9 @@ impl LightVolumeRenderer {
                 &[ResourceBindGroup {
                     bindings: &[ResourceBinding::Buffer {
                         buffer: uniform_buffer_cache
-                            .write(server, StaticUniformBuffer::<256>::new().with(&mvp))?,
+                            .write(StaticUniformBuffer::<256>::new().with(&mvp))?,
                         shader_location: self.flat_shader.uniform_buffer_binding,
+                        data_usage: Default::default(),
                     }],
                 }],
                 ElementRange::Full,
@@ -257,7 +256,6 @@ impl LightVolumeRenderer {
                         ResourceBinding::texture(&gbuffer.depth(), &shader.depth_sampler),
                         ResourceBinding::Buffer {
                             buffer: uniform_buffer_cache.write(
-                                server,
                                 StaticUniformBuffer::<256>::new()
                                     .with(&frame_matrix)
                                     .with(&inv_proj)
@@ -269,6 +267,7 @@ impl LightVolumeRenderer {
                                     .with(&((spot.full_cone_angle() * 0.5).cos())),
                             )?,
                             shader_location: shader.uniform_block_binding,
+                            data_usage: Default::default(),
                         },
                     ],
                 }],
@@ -290,10 +289,10 @@ impl LightVolumeRenderer {
             let mvp = view_proj * light_shape_matrix;
 
             let uniform_buffer =
-                uniform_buffer_cache.write(server, StaticUniformBuffer::<256>::new().with(&mvp))?;
+                uniform_buffer_cache.write(StaticUniformBuffer::<256>::new().with(&mvp))?;
 
             stats += frame_buffer.draw(
-                &self.sphere,
+                &*self.sphere,
                 viewport,
                 &*self.flat_shader.program,
                 &DrawParameters {
@@ -319,6 +318,7 @@ impl LightVolumeRenderer {
                     bindings: &[ResourceBinding::Buffer {
                         buffer: uniform_buffer,
                         shader_location: self.flat_shader.uniform_buffer_binding,
+                        data_usage: Default::default(),
                     }],
                 }],
                 ElementRange::Full,
@@ -358,7 +358,6 @@ impl LightVolumeRenderer {
                         ResourceBinding::texture(&gbuffer.depth(), &shader.depth_sampler),
                         ResourceBinding::Buffer {
                             buffer: uniform_buffer_cache.write(
-                                server,
                                 StaticUniformBuffer::<256>::new()
                                     .with(&frame_matrix)
                                     .with(&inv_proj)
@@ -371,6 +370,7 @@ impl LightVolumeRenderer {
                                     .with(&point.radius()),
                             )?,
                             shader_location: shader.uniform_block_binding,
+                            data_usage: Default::default(),
                         },
                     ],
                 }],

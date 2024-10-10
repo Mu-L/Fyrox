@@ -51,6 +51,7 @@ mod skybox_shader;
 mod ssao;
 mod stats;
 
+use crate::renderer::cache::uniform::UniformMemoryAllocator;
 use crate::{
     asset::{event::ResourceEvent, manager::ResourceManager},
     core::{
@@ -86,7 +87,6 @@ use crate::{
                 Attachment, AttachmentKind, FrameBuffer, ResourceBindGroup, ResourceBinding,
             },
             geometry_buffer::{DrawCallStatistics, GeometryBuffer},
-            gl::server::{GlGraphicsServer, SharedPipelineState},
             gpu_texture::{
                 Coordinate, GpuTexture, GpuTextureKind, MagnificationFilter, MinificationFilter,
                 PixelKind, WrapMode,
@@ -107,6 +107,8 @@ use crate::{
     scene::{camera::Camera, mesh::surface::SurfaceData, Scene, SceneContainer},
 };
 use fxhash::FxHashMap;
+use fyrox_graphics::gl::server::GlGraphicsServer;
+use fyrox_graphics::server::SharedGraphicsServer;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 pub use stats::*;
@@ -499,7 +501,7 @@ pub struct AssociatedSceneData {
 impl AssociatedSceneData {
     /// Creates new scene data.
     pub fn new(
-        server: &GlGraphicsServer,
+        server: &dyn GraphicsServer,
         width: usize,
         height: usize,
     ) -> Result<Self, FrameworkError> {
@@ -592,9 +594,8 @@ impl AssociatedSceneData {
         })
     }
 
-    fn copy_depth_stencil_to_scene_framebuffer(&mut self, server: &GlGraphicsServer) {
-        server.blit_framebuffer(
-            self.gbuffer.framebuffer(),
+    fn copy_depth_stencil_to_scene_framebuffer(&mut self) {
+        self.gbuffer.framebuffer().blit_to(
             &*self.hdr_scene_framebuffer,
             0,
             0,
@@ -669,7 +670,7 @@ pub struct Renderer {
     /// User interface renderer.
     pub ui_renderer: UiRenderer,
     statistics: Statistics,
-    quad: GeometryBuffer,
+    quad: Box<dyn GeometryBuffer>,
     frame_size: (u32, u32),
     quality_settings: QualitySettings,
     /// Debug renderer instance can be used for debugging purposes
@@ -694,17 +695,18 @@ pub struct Renderer {
     // TextureId -> FrameBuffer mapping. This mapping is used for temporal frame buffers
     // like ones used to render UI instances.
     ui_frame_buffers: FxHashMap<u64, Box<dyn FrameBuffer>>,
+    uniform_memory_allocator: UniformMemoryAllocator,
     /// A stub uniform buffer for situation when there's no actual bone matrices.
     pub bone_matrices_stub_uniform_buffer: Box<dyn Buffer>,
     /// Visibility cache based on occlusion query.
     pub visibility_cache: VisibilityCache,
-    /// Pipeline state.
-    pub state: SharedPipelineState,
+    /// Graphics server.
+    pub server: SharedGraphicsServer,
 }
 
 fn make_ui_frame_buffer(
     frame_size: Vector2<f32>,
-    server: &GlGraphicsServer,
+    server: &dyn GraphicsServer,
     pixel_kind: PixelKind,
 ) -> Result<Box<dyn FrameBuffer>, FrameworkError> {
     let color_texture = server.create_texture(
@@ -746,7 +748,7 @@ fn make_ui_frame_buffer(
 /// A context for custom scene render passes.
 pub struct SceneRenderPassContext<'a, 'b> {
     /// A graphics server that is used as a wrapper to underlying graphics API.
-    pub server: &'a GlGraphicsServer,
+    pub server: &'a dyn GraphicsServer,
 
     /// A texture cache that uploads engine's `Texture` as internal `GpuTexture` to GPU.
     /// Use this to get a corresponding GPU texture by an instance of a `Texture`.
@@ -837,6 +839,10 @@ pub struct SceneRenderPassContext<'a, 'b> {
 
     /// A stub uniform buffer with bone matrices.
     pub bone_matrices_stub_uniform_buffer: &'a dyn Buffer,
+
+    /// Memory allocator for uniform buffers that tries to pack uniforms densely into large uniform
+    /// buffers, giving you offsets to the data.
+    pub uniform_memory_allocator: &'a mut UniformMemoryAllocator,
 }
 
 /// A trait for custom scene rendering pass. It could be used to add your own rendering techniques.
@@ -866,13 +872,12 @@ pub trait SceneRenderPass {
 }
 
 fn blit_pixels(
-    server: &dyn GraphicsServer,
     uniform_buffer_cache: &mut UniformBufferCache,
     framebuffer: &mut dyn FrameBuffer,
     texture: Rc<RefCell<dyn GpuTexture>>,
     shader: &FlatShader,
     viewport: Rect<i32>,
-    quad: &GeometryBuffer,
+    quad: &dyn GeometryBuffer,
 ) -> Result<DrawCallStatistics, FrameworkError> {
     let matrix = Matrix4::new_orthographic(
         0.0,
@@ -887,7 +892,7 @@ fn blit_pixels(
         0.0,
     ));
     let uniform_buffer =
-        uniform_buffer_cache.write(server, StaticUniformBuffer::<256>::new().with(&matrix))?;
+        uniform_buffer_cache.write(StaticUniformBuffer::<256>::new().with(&matrix))?;
     framebuffer.draw(
         quad,
         viewport,
@@ -908,6 +913,7 @@ fn blit_pixels(
                 ResourceBinding::Buffer {
                     buffer: uniform_buffer,
                     shader_location: shader.uniform_buffer_binding,
+                    data_usage: Default::default(),
                 },
             ],
         }],
@@ -966,24 +972,27 @@ impl Renderer {
             window_builder,
         )?;
 
-        Log::info(format!(
-            "Graphics Server Capabilities\n{}",
-            server.capabilities()
-        ));
+        let caps = server.capabilities();
+        Log::info(format!("Graphics Server Capabilities\n{caps}",));
 
         let frame_size = (window.inner_size().width, window.inner_size().height);
 
         let mut shader_cache = ShaderCache::default();
 
         for shader in ShaderResource::standard_shaders() {
-            shader_cache.get(&server, &shader.resource);
+            shader_cache.get(&*server, &shader.resource);
         }
+
+        let uniform_memory_allocator = UniformMemoryAllocator::new(
+            caps.max_uniform_block_size,
+            caps.uniform_buffer_offset_alignment,
+        );
 
         let renderer = Self {
             backbuffer: server.back_buffer(),
             frame_size,
-            deferred_light_renderer: DeferredLightRenderer::new(&server, frame_size, &settings)?,
-            flat_shader: FlatShader::new(&server)?,
+            deferred_light_renderer: DeferredLightRenderer::new(&*server, frame_size, &settings)?,
+            flat_shader: FlatShader::new(&*server)?,
             white_dummy: server.create_texture(
                 GpuTextureKind::Rectangle {
                     width: 1,
@@ -1058,10 +1067,10 @@ impl Renderer {
                 1,
                 Some(&[0u8, 0u8, 0u8, 0u8]),
             )?,
-            quad: GeometryBuffer::from_surface_data(
+            quad: <dyn GeometryBuffer>::from_surface_data(
                 &SurfaceData::make_unit_xy_quad(),
                 BufferUsage::StaticDraw,
-                &server,
+                &*server,
             )?,
             bone_matrices_stub_uniform_buffer: {
                 let buffer = server.create_buffer(
@@ -1074,26 +1083,27 @@ impl Renderer {
                 buffer.write_data(array_as_u8_slice(&zeros))?;
                 buffer
             },
-            ui_renderer: UiRenderer::new(&server)?,
+            ui_renderer: UiRenderer::new(&*server)?,
             quality_settings: settings,
-            debug_renderer: DebugRenderer::new(&server)?,
-            screen_space_debug_renderer: DebugRenderer::new(&server)?,
+            debug_renderer: DebugRenderer::new(&*server)?,
+            screen_space_debug_renderer: DebugRenderer::new(&*server)?,
             scene_data_map: Default::default(),
             backbuffer_clear_color: Color::BLACK,
             texture_cache: Default::default(),
             geometry_cache: Default::default(),
             forward_renderer: ForwardRenderer::new(),
             ui_frame_buffers: Default::default(),
-            fxaa_renderer: FxaaRenderer::new(&server)?,
+            fxaa_renderer: FxaaRenderer::new(&*server)?,
             statistics: Statistics::default(),
             shader_event_receiver,
             texture_event_receiver,
             shader_cache,
             scene_render_passes: Default::default(),
-            matrix_storage: MatrixStorageCache::new(&server)?,
-            state: server,
+            matrix_storage: MatrixStorageCache::new(&*server)?,
+            uniform_buffer_cache: UniformBufferCache::new(server.clone()),
+            server,
             visibility_cache: Default::default(),
-            uniform_buffer_cache: Default::default(),
+            uniform_memory_allocator,
         };
 
         Ok((window, renderer))
@@ -1140,9 +1150,9 @@ impl Renderer {
         self.backbuffer_clear_color = color;
     }
 
-    /// Returns a reference to current pipeline state.
-    pub fn pipeline_state(&self) -> &GlGraphicsServer {
-        &self.state
+    /// Returns a reference to current graphics server.
+    pub fn graphics_server(&self) -> &dyn GraphicsServer {
+        &*self.server
     }
 
     /// Sets new frame size. You should call the same method on [`crate::engine::Engine`]
@@ -1158,9 +1168,9 @@ impl Renderer {
         self.frame_size.1 = new_size.1.max(1);
 
         self.deferred_light_renderer
-            .set_frame_size(&self.state, new_size)?;
+            .set_frame_size(&*self.server, new_size)?;
 
-        self.pipeline_state().set_frame_size(new_size);
+        self.graphics_server().set_frame_size(new_size);
 
         Ok(())
     }
@@ -1184,7 +1194,7 @@ impl Renderer {
     ) -> Result<(), FrameworkError> {
         self.quality_settings = *settings;
         self.deferred_light_renderer
-            .set_quality_settings(&self.state, settings)
+            .set_quality_settings(&*self.server, settings)
     }
 
     /// Returns current quality settings.
@@ -1224,16 +1234,19 @@ impl Renderer {
                         || height != new_height
                         || frame.texture.borrow().pixel_kind() != pixel_kind
                     {
-                        *frame_buffer = make_ui_frame_buffer(screen_size, &self.state, pixel_kind)?;
+                        *frame_buffer =
+                            make_ui_frame_buffer(screen_size, &*self.server, pixel_kind)?;
                     }
                 } else {
                     panic!("ui can be rendered only in rectangle texture!")
                 }
                 frame_buffer
             }
-            Entry::Vacant(entry) => {
-                entry.insert(make_ui_frame_buffer(screen_size, &self.state, pixel_kind)?)
-            }
+            Entry::Vacant(entry) => entry.insert(make_ui_frame_buffer(
+                screen_size,
+                &*self.server,
+                pixel_kind,
+            )?),
         };
         let frame_buffer = &mut **frame_buffer;
 
@@ -1242,7 +1255,7 @@ impl Renderer {
         frame_buffer.clear(viewport, Some(clear_color), Some(0.0), Some(0));
 
         self.statistics += self.ui_renderer.render(UiRenderContext {
-            state: &mut self.state,
+            server: &*self.server,
             viewport,
             frame_buffer,
             frame_width: screen_size.x,
@@ -1279,7 +1292,7 @@ impl Renderer {
         while let Ok(event) = self.texture_event_receiver.try_recv() {
             if let ResourceEvent::Loaded(resource) | ResourceEvent::Reloaded(resource) = event {
                 if let Some(texture) = resource.try_cast::<Texture>() {
-                    match self.texture_cache.upload(&self.state, &texture) {
+                    match self.texture_cache.upload(&*self.server, &texture) {
                         Ok(_) => {
                             uploaded += 1;
                             if uploaded >= THROUGHPUT {
@@ -1306,7 +1319,7 @@ impl Renderer {
                 if let Some(shader) = resource.try_cast::<Shader>() {
                     // Remove and immediately "touch" the shader cache to force upload shader.
                     self.shader_cache.remove(&shader);
-                    let _ = self.shader_cache.get(&self.state, &shader);
+                    let _ = self.shader_cache.get(&*self.server, &shader);
                 }
             }
         }
@@ -1358,7 +1371,7 @@ impl Renderer {
             // Clamp to [1.0; infinity] range.
             .sup(&Vector2::new(1.0, 1.0));
 
-        let server = &mut self.state;
+        let server = &*self.server;
 
         let scene_associated_data = self
             .scene_data_map
@@ -1449,13 +1462,14 @@ impl Renderer {
                     graph,
                     uniform_buffer_cache: &mut self.uniform_buffer_cache,
                     bone_matrices_stub_uniform_buffer: &*self.bone_matrices_stub_uniform_buffer,
+                    uniform_memory_allocator: &mut self.uniform_memory_allocator,
                     screen_space_debug_renderer: &mut self.screen_space_debug_renderer,
-                    unit_quad: &self.quad,
+                    unit_quad: &*self.quad,
                 })?;
 
             server.set_polygon_fill_mode(PolygonFace::FrontAndBack, PolygonFillMode::Fill);
 
-            scene_associated_data.copy_depth_stencil_to_scene_framebuffer(server);
+            scene_associated_data.copy_depth_stencil_to_scene_framebuffer();
 
             scene_associated_data.hdr_scene_framebuffer.clear(
                 viewport,
@@ -1489,6 +1503,7 @@ impl Renderer {
                         uniform_buffer_cache: &mut self.uniform_buffer_cache,
                         bone_matrices_stub_uniform_buffer: &*self.bone_matrices_stub_uniform_buffer,
                         visibility_cache,
+                        uniform_memory_allocator: &mut self.uniform_memory_allocator,
                     })?;
 
             scene_associated_data.statistics += light_stats;
@@ -1516,6 +1531,7 @@ impl Renderer {
                     uniform_buffer_cache: &mut self.uniform_buffer_cache,
                     ambient_light: scene.rendering_options.ambient_lighting_color,
                     bone_matrices_stub_uniform_buffer: &*self.bone_matrices_stub_uniform_buffer,
+                    uniform_memory_allocator: &mut self.uniform_memory_allocator,
                 })?;
 
             for render_pass in self.scene_render_passes.iter() {
@@ -1547,6 +1563,7 @@ impl Renderer {
                             uniform_buffer_cache: &mut self.uniform_buffer_cache,
                             bone_matrices_stub_uniform_buffer: &*self
                                 .bone_matrices_stub_uniform_buffer,
+                            uniform_memory_allocator: &mut self.uniform_memory_allocator,
                         })?;
             }
 
@@ -1554,8 +1571,7 @@ impl Renderer {
 
             // Prepare glow map.
             scene_associated_data.statistics += scene_associated_data.bloom_renderer.render(
-                &**server,
-                quad,
+                &**quad,
                 scene_associated_data.hdr_scene_frame_texture(),
                 &mut self.uniform_buffer_cache,
             )?;
@@ -1567,7 +1583,7 @@ impl Renderer {
                 scene_associated_data.bloom_renderer.result(),
                 &mut *scene_associated_data.ldr_scene_framebuffer,
                 viewport,
-                quad,
+                &**quad,
                 dt,
                 camera.exposure(),
                 camera.color_grading_lut_ref(),
@@ -1579,7 +1595,6 @@ impl Renderer {
             // Apply FXAA if needed.
             if self.quality_settings.fxaa {
                 scene_associated_data.statistics += self.fxaa_renderer.render(
-                    &**server,
                     viewport,
                     scene_associated_data.ldr_scene_frame_texture(),
                     &mut *scene_associated_data.ldr_temp_framebuffer,
@@ -1589,21 +1604,18 @@ impl Renderer {
                 let quad = &self.quad;
                 let temp_frame_texture = scene_associated_data.ldr_temp_frame_texture();
                 scene_associated_data.statistics += blit_pixels(
-                    &**server,
                     &mut self.uniform_buffer_cache,
                     &mut *scene_associated_data.ldr_scene_framebuffer,
                     temp_frame_texture,
                     &self.flat_shader,
                     viewport,
-                    quad,
+                    &**quad,
                 )?;
             }
 
             // Render debug geometry in the LDR frame buffer.
-            self.debug_renderer
-                .set_lines(server, &scene.drawing_context.lines);
+            self.debug_renderer.set_lines(&scene.drawing_context.lines);
             scene_associated_data.statistics += self.debug_renderer.render(
-                &**server,
                 &mut self.uniform_buffer_cache,
                 viewport,
                 &mut *scene_associated_data.ldr_scene_framebuffer,
@@ -1639,6 +1651,7 @@ impl Renderer {
                             uniform_buffer_cache: &mut self.uniform_buffer_cache,
                             bone_matrices_stub_uniform_buffer: &*self
                                 .bone_matrices_stub_uniform_buffer,
+                            uniform_memory_allocator: &mut self.uniform_memory_allocator,
                         })?;
             }
         }
@@ -1649,13 +1662,12 @@ impl Renderer {
         if scene.rendering_options.render_target.is_none() {
             let quad = &self.quad;
             scene_associated_data.statistics += blit_pixels(
-                &**server,
                 &mut self.uniform_buffer_cache,
                 &mut *self.backbuffer,
                 scene_associated_data.ldr_scene_frame_texture(),
                 &self.flat_shader,
                 window_viewport,
-                quad,
+                &**quad,
             )?;
         }
 
@@ -1676,6 +1688,7 @@ impl Renderer {
 
         self.matrix_storage.begin_frame();
         self.uniform_buffer_cache.mark_all_unused();
+        self.uniform_memory_allocator.clear();
 
         // Make sure to drop associated data for destroyed scenes.
         self.scene_data_map
@@ -1685,7 +1698,7 @@ impl Renderer {
         // or other GL resources can be destroyed and then on their "names" some new resource
         // are created, but cache still thinks that resource is correctly bound, but it is different
         // object have same name.
-        self.state.invalidate_resource_bindings_cache();
+        self.server.invalidate_resource_bindings_cache();
         let dt = self.statistics.capped_frame_time;
         self.statistics.begin_frame();
 
@@ -1704,13 +1717,13 @@ impl Renderer {
             self.render_scene(scene_handle, scene, dt)?;
         }
 
-        self.pipeline_state()
+        self.graphics_server()
             .set_polygon_fill_mode(PolygonFace::FrontAndBack, PolygonFillMode::Fill);
 
         // Render UI on top of everything without gamma correction.
         for drawing_context in drawing_contexts {
             self.statistics += self.ui_renderer.render(UiRenderContext {
-                state: &mut self.state,
+                server: &*self.server,
                 viewport: window_viewport,
                 frame_buffer: &mut *self.backbuffer,
                 frame_width: backbuffer_width,
@@ -1726,7 +1739,6 @@ impl Renderer {
         let screen_matrix =
             Matrix4::new_orthographic(0.0, backbuffer_width, backbuffer_height, 0.0, -1.0, 1.0);
         self.screen_space_debug_renderer.render(
-            &*self.state,
             &mut self.uniform_buffer_cache,
             window_viewport,
             &mut *self.backbuffer,
@@ -1750,9 +1762,9 @@ impl Renderer {
         self.render_frame(scenes, drawing_contexts)?;
         self.statistics.end_frame();
         window.pre_present_notify();
-        self.pipeline_state().swap_buffers()?;
+        self.graphics_server().swap_buffers()?;
         self.statistics.finalize();
-        self.statistics.pipeline = self.state.pipeline_statistics();
+        self.statistics.pipeline = self.server.pipeline_statistics();
         Ok(())
     }
 }

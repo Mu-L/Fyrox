@@ -18,28 +18,28 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use crate::renderer::cache::uniform::UniformBufferCache;
 use crate::{
     core::{color::Color, math::Rect, ImmutableString},
     renderer::{
+        cache::uniform::UniformBufferCache,
         framework::{
             error::FrameworkError,
-            framebuffer::{Attachment, AttachmentKind, FrameBuffer},
+            framebuffer::{
+                Attachment, AttachmentKind, FrameBuffer, ResourceBindGroup, ResourceBinding,
+            },
             geometry_buffer::GeometryBuffer,
-            gl::server::GlGraphicsServer,
             gpu_program::{GpuProgram, UniformLocation},
             gpu_texture::{
                 GpuTexture, GpuTextureKind, MagnificationFilter, MinificationFilter, PixelKind,
             },
-            pixel_buffer::PixelBuffer,
+            read_buffer::AsyncReadBuffer,
+            server::GraphicsServer,
+            uniform::StaticUniformBuffer,
             ColorMask, DrawParameters, ElementRange,
         },
         make_viewport_matrix,
     },
 };
-use fyrox_graphics::framebuffer::{ResourceBindGroup, ResourceBinding};
-use fyrox_graphics::server::GraphicsServer;
-use fyrox_graphics::uniform::StaticUniformBuffer;
 use std::{cell::RefCell, rc::Rc};
 
 struct VisibilityOptimizerShader {
@@ -49,7 +49,7 @@ struct VisibilityOptimizerShader {
 }
 
 impl VisibilityOptimizerShader {
-    fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
+    fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
         let fragment_source = include_str!("../shaders/visibility_optimizer_fs.glsl");
         let vertex_source = include_str!("../shaders/visibility_optimizer_vs.glsl");
         let program =
@@ -66,7 +66,7 @@ impl VisibilityOptimizerShader {
 
 pub struct VisibilityBufferOptimizer {
     framebuffer: Box<dyn FrameBuffer>,
-    pixel_buffer: PixelBuffer<u32>,
+    pixel_buffer: Box<dyn AsyncReadBuffer>,
     shader: VisibilityOptimizerShader,
     w_tiles: usize,
     h_tiles: usize,
@@ -74,7 +74,7 @@ pub struct VisibilityBufferOptimizer {
 
 impl VisibilityBufferOptimizer {
     pub fn new(
-        server: &GlGraphicsServer,
+        server: &dyn GraphicsServer,
         w_tiles: usize,
         h_tiles: usize,
     ) -> Result<Self, FrameworkError> {
@@ -98,7 +98,7 @@ impl VisibilityBufferOptimizer {
                     texture: optimized_visibility_buffer,
                 }],
             )?,
-            pixel_buffer: PixelBuffer::new(server, w_tiles * h_tiles)?,
+            pixel_buffer: server.create_async_read_buffer(size_of::<u32>(), w_tiles * h_tiles)?,
             shader: VisibilityOptimizerShader::new(server)?,
             w_tiles,
             h_tiles,
@@ -109,15 +109,14 @@ impl VisibilityBufferOptimizer {
         self.pixel_buffer.is_request_running()
     }
 
-    pub fn read_visibility_mask(&mut self, server: &GlGraphicsServer) -> Option<Vec<u32>> {
-        self.pixel_buffer.try_read(server)
+    pub fn read_visibility_mask(&mut self) -> Option<Vec<u32>> {
+        self.pixel_buffer.try_read_of_type()
     }
 
     pub fn optimize(
         &mut self,
-        server: &GlGraphicsServer,
         visibility_buffer: &Rc<RefCell<dyn GpuTexture>>,
-        unit_quad: &GeometryBuffer,
+        unit_quad: &dyn GeometryBuffer,
         tile_size: i32,
         uniform_buffer_cache: &mut UniformBufferCache,
     ) -> Result<(), FrameworkError> {
@@ -150,12 +149,12 @@ impl VisibilityBufferOptimizer {
                     ),
                     ResourceBinding::Buffer {
                         buffer: uniform_buffer_cache.write(
-                            server,
                             StaticUniformBuffer::<256>::new()
                                 .with(&matrix)
                                 .with(&tile_size),
                         )?,
                         shader_location: self.shader.uniform_buffer_binding,
+                        data_usage: Default::default(),
                     },
                 ],
             }],
@@ -163,7 +162,7 @@ impl VisibilityBufferOptimizer {
         )?;
 
         self.pixel_buffer
-            .schedule_pixels_transfer(server, &*self.framebuffer, 0, None)?;
+            .schedule_pixels_transfer(&*self.framebuffer, 0, None)?;
 
         Ok(())
     }

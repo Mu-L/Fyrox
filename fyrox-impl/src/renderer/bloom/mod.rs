@@ -29,7 +29,6 @@ use crate::{
                 Attachment, AttachmentKind, FrameBuffer, ResourceBindGroup, ResourceBinding,
             },
             geometry_buffer::GeometryBuffer,
-            gl::server::GlGraphicsServer,
             gpu_program::{GpuProgram, UniformLocation},
             gpu_texture::{
                 Coordinate, GpuTexture, GpuTextureKind, MagnificationFilter, MinificationFilter,
@@ -53,7 +52,7 @@ struct Shader {
 }
 
 impl Shader {
-    fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
+    fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
         let fragment_source = include_str!("../shaders/bloom_fs.glsl");
         let vertex_source = include_str!("../shaders/bloom_vs.glsl");
 
@@ -77,7 +76,7 @@ pub struct BloomRenderer {
 
 impl BloomRenderer {
     pub fn new(
-        server: &GlGraphicsServer,
+        server: &dyn GraphicsServer,
         width: usize,
         height: usize,
     ) -> Result<Self, FrameworkError> {
@@ -125,8 +124,7 @@ impl BloomRenderer {
 
     pub(crate) fn render(
         &mut self,
-        server: &dyn GraphicsServer,
-        quad: &GeometryBuffer,
+        quad: &dyn GeometryBuffer,
         hdr_scene_frame: Rc<RefCell<dyn GpuTexture>>,
         uniform_buffer_cache: &mut UniformBufferCache,
     ) -> Result<RenderPassStatistics, FrameworkError> {
@@ -154,10 +152,10 @@ impl BloomRenderer {
                     ResourceBinding::texture(&hdr_scene_frame, &shader.hdr_sampler),
                     ResourceBinding::Buffer {
                         buffer: uniform_buffer_cache.write(
-                            server,
                             StaticUniformBuffer::<256>::new().with(&make_viewport_matrix(viewport)),
                         )?,
                         shader_location: shader.uniform_block_binding,
+                        data_usage: Default::default(),
                     },
                 ],
             }],
@@ -166,7 +164,7 @@ impl BloomRenderer {
 
         stats += self
             .blur
-            .render(server, quad, self.glow_texture(), uniform_buffer_cache)?;
+            .render(quad, self.glow_texture(), uniform_buffer_cache)?;
 
         Ok(stats)
     }

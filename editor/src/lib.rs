@@ -90,7 +90,7 @@ use crate::{
             watcher::FileSystemWatcher,
             TypeUuidProvider,
         },
-        dpi::{LogicalSize, PhysicalPosition},
+        dpi::{PhysicalPosition, PhysicalSize},
         engine::{Engine, EngineInitParams, GraphicsContextParams, SerializationContext},
         event::{Event, WindowEvent},
         event_loop::{EventLoop, EventLoopWindowTarget},
@@ -561,7 +561,7 @@ impl Editor {
             )),
         }
 
-        let inner_size = LogicalSize::new(
+        let inner_size = PhysicalSize::new(
             settings.windows.window_size.x,
             settings.windows.window_size.y,
         );
@@ -2705,14 +2705,14 @@ impl Editor {
             graphics_context.window.scale_factor() as f32,
         );
 
-        let overlay_pass = OverlayRenderPass::new(graphics_context.renderer.pipeline_state());
+        let overlay_pass = OverlayRenderPass::new(graphics_context.renderer.graphics_server());
         graphics_context
             .renderer
             .add_render_pass(overlay_pass.clone());
         self.overlay_pass = Some(overlay_pass);
 
         let highlighter = HighlightRenderPass::new(
-            &graphics_context.renderer.state,
+            &*graphics_context.renderer.server,
             self.settings.windows.window_size.x as usize,
             self.settings.windows.window_size.y as usize,
         );

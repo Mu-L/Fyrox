@@ -18,32 +18,34 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use crate::{
-    core::sstorage::ImmutableString,
-    renderer::framework::{
-        error::FrameworkError,
-        gpu_program::{GpuProgram, UniformLocation},
-        server::GraphicsServer,
-    },
-};
+use crate::{core::math::Rect, error::FrameworkError, framebuffer::FrameBuffer};
+use bytemuck::Pod;
 
-pub struct SkyboxShader {
-    pub program: Box<dyn GpuProgram>,
-    pub uniform_buffer_binding: usize,
-    pub cubemap_texture: UniformLocation,
+pub trait AsyncReadBuffer {
+    fn schedule_pixels_transfer(
+        &mut self,
+        framebuffer: &dyn FrameBuffer,
+        color_buffer_index: u32,
+        rect: Option<Rect<i32>>,
+    ) -> Result<(), FrameworkError>;
+    fn is_request_running(&self) -> bool;
+    fn try_read(&mut self) -> Option<Vec<u8>>;
 }
 
-impl SkyboxShader {
-    pub fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
-        let fragment_source = include_str!("shaders/skybox_fs.glsl");
-        let vertex_source = include_str!("shaders/skybox_vs.glsl");
-
-        let program = server.create_program("SkyboxShader", vertex_source, fragment_source)?;
-        Ok(Self {
-            uniform_buffer_binding: program
-                .uniform_block_index(&ImmutableString::new("Uniforms"))?,
-            cubemap_texture: program.uniform_location(&ImmutableString::new("cubemapTexture"))?,
-            program,
-        })
+impl dyn AsyncReadBuffer {
+    pub fn try_read_of_type<T>(&mut self) -> Option<Vec<T>>
+    where
+        T: Pod,
+    {
+        let mut bytes = self.try_read()?;
+        let typed = unsafe {
+            Some(Vec::from_raw_parts(
+                bytes.as_mut_ptr() as *mut T,
+                bytes.len() / size_of::<T>(),
+                bytes.capacity() / size_of::<T>(),
+            ))
+        };
+        std::mem::forget(bytes);
+        typed
     }
 }

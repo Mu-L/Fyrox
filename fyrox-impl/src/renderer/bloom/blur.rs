@@ -28,7 +28,6 @@ use crate::{
                 Attachment, AttachmentKind, FrameBuffer, ResourceBindGroup, ResourceBinding,
             },
             geometry_buffer::GeometryBuffer,
-            gl::server::GlGraphicsServer,
             gpu_program::{GpuProgram, UniformLocation},
             gpu_texture::{
                 Coordinate, GpuTexture, GpuTextureKind, MagnificationFilter, MinificationFilter,
@@ -50,7 +49,7 @@ struct Shader {
 }
 
 impl Shader {
-    fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
+    fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
         let fragment_source = include_str!("../shaders/gaussian_blur_fs.glsl");
         let vertex_source = include_str!("../shaders/gaussian_blur_vs.glsl");
 
@@ -74,7 +73,7 @@ pub struct GaussianBlur {
 }
 
 fn create_framebuffer(
-    server: &GlGraphicsServer,
+    server: &dyn GraphicsServer,
     width: usize,
     height: usize,
     pixel_kind: PixelKind,
@@ -109,7 +108,7 @@ fn create_framebuffer(
 
 impl GaussianBlur {
     pub fn new(
-        server: &GlGraphicsServer,
+        server: &dyn GraphicsServer,
         width: usize,
         height: usize,
         pixel_kind: PixelKind,
@@ -133,8 +132,7 @@ impl GaussianBlur {
 
     pub(crate) fn render(
         &mut self,
-        server: &dyn GraphicsServer,
-        quad: &GeometryBuffer,
+        quad: &dyn GeometryBuffer,
         input: Rc<RefCell<dyn GpuTexture>>,
         uniform_buffer_cache: &mut UniformBufferCache,
     ) -> Result<RenderPassStatistics, FrameworkError> {
@@ -165,13 +163,13 @@ impl GaussianBlur {
                     ResourceBinding::texture(&input, &shader.image),
                     ResourceBinding::Buffer {
                         buffer: uniform_buffer_cache.write(
-                            server,
                             StaticUniformBuffer::<256>::new()
                                 .with(&make_viewport_matrix(viewport))
                                 .with(&inv_size)
                                 .with(&true),
                         )?,
                         shader_location: shader.uniform_block_binding,
+                        data_usage: Default::default(),
                     },
                 ],
             }],
@@ -199,13 +197,13 @@ impl GaussianBlur {
                     ResourceBinding::texture(&h_blurred_texture, &shader.image),
                     ResourceBinding::Buffer {
                         buffer: uniform_buffer_cache.write(
-                            server,
                             StaticUniformBuffer::<256>::new()
                                 .with(&make_viewport_matrix(viewport))
                                 .with(&inv_size)
                                 .with(&false),
                         )?,
                         shader_location: shader.uniform_block_binding,
+                        data_usage: Default::default(),
                     },
                 ],
             }],

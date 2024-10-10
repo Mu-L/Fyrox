@@ -29,7 +29,6 @@ use crate::{
                 Attachment, AttachmentKind, FrameBuffer, ResourceBindGroup, ResourceBinding,
             },
             geometry_buffer::{DrawCallStatistics, GeometryBuffer},
-            gl::server::GlGraphicsServer,
             gpu_program::{GpuProgram, UniformLocation},
             gpu_texture::{
                 Coordinate, GpuTexture, GpuTextureKind, MagnificationFilter, MinificationFilter,
@@ -52,7 +51,7 @@ struct Shader {
 }
 
 impl Shader {
-    fn new(server: &GlGraphicsServer) -> Result<Self, FrameworkError> {
+    fn new(server: &dyn GraphicsServer) -> Result<Self, FrameworkError> {
         let fragment_source = include_str!("../shaders/blur_fs.glsl");
         let vertex_source = include_str!("../shaders/blur_vs.glsl");
 
@@ -69,14 +68,14 @@ impl Shader {
 pub struct Blur {
     shader: Shader,
     framebuffer: Box<dyn FrameBuffer>,
-    quad: GeometryBuffer,
+    quad: Box<dyn GeometryBuffer>,
     width: usize,
     height: usize,
 }
 
 impl Blur {
     pub fn new(
-        server: &GlGraphicsServer,
+        server: &dyn GraphicsServer,
         width: usize,
         height: usize,
     ) -> Result<Self, FrameworkError> {
@@ -108,7 +107,7 @@ impl Blur {
                     texture: frame,
                 }],
             )?,
-            quad: GeometryBuffer::from_surface_data(
+            quad: <dyn GeometryBuffer>::from_surface_data(
                 &SurfaceData::make_unit_xy_quad(),
                 BufferUsage::StaticDraw,
                 server,
@@ -124,7 +123,6 @@ impl Blur {
 
     pub(crate) fn render(
         &mut self,
-        server: &dyn GraphicsServer,
         input: Rc<RefCell<dyn GpuTexture>>,
         uniform_buffer_cache: &mut UniformBufferCache,
     ) -> Result<DrawCallStatistics, FrameworkError> {
@@ -132,7 +130,7 @@ impl Blur {
 
         let shader = &self.shader;
         self.framebuffer.draw(
-            &self.quad,
+            &*self.quad,
             viewport,
             &*shader.program,
             &DrawParameters {
@@ -150,10 +148,10 @@ impl Blur {
                     ResourceBinding::texture(&input, &shader.input_texture),
                     ResourceBinding::Buffer {
                         buffer: uniform_buffer_cache.write(
-                            server,
                             StaticUniformBuffer::<256>::new().with(&make_viewport_matrix(viewport)),
                         )?,
                         shader_location: shader.uniform_buffer_binding,
+                        data_usage: Default::default(),
                     },
                 ],
             }],

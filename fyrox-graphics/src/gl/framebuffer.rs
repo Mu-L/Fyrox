@@ -18,6 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+use crate::framebuffer::BufferDataUsage;
+use crate::gl::geometry_buffer::GlGeometryBuffer;
 use crate::{
     buffer::{Buffer, BufferKind},
     core::{color::Color, math::Rect},
@@ -189,6 +191,59 @@ impl FrameBuffer for GlFrameBuffer {
         }
     }
 
+    fn blit_to(
+        &self,
+        dest: &dyn FrameBuffer,
+        src_x0: i32,
+        src_y0: i32,
+        src_x1: i32,
+        src_y1: i32,
+        dst_x0: i32,
+        dst_y0: i32,
+        dst_x1: i32,
+        dst_y1: i32,
+        copy_color: bool,
+        copy_depth: bool,
+        copy_stencil: bool,
+    ) {
+        let server = self.state.upgrade().unwrap();
+
+        let source = self;
+        let dest = dest.as_any().downcast_ref::<GlFrameBuffer>().unwrap();
+
+        let mut mask = 0;
+        if copy_color {
+            mask |= glow::COLOR_BUFFER_BIT;
+        }
+        if copy_depth {
+            mask |= glow::DEPTH_BUFFER_BIT;
+        }
+        if copy_stencil {
+            mask |= glow::STENCIL_BUFFER_BIT;
+        }
+
+        unsafe {
+            server
+                .gl
+                .bind_framebuffer(glow::READ_FRAMEBUFFER, source.id());
+            server
+                .gl
+                .bind_framebuffer(glow::DRAW_FRAMEBUFFER, dest.id());
+            server.gl.blit_framebuffer(
+                src_x0,
+                src_y0,
+                src_x1,
+                src_y1,
+                dst_x0,
+                dst_y0,
+                dst_x1,
+                dst_y1,
+                mask,
+                glow::NEAREST,
+            );
+        }
+    }
+
     fn clear(
         &mut self,
         viewport: Rect<i32>,
@@ -306,7 +361,7 @@ impl FrameBuffer for GlFrameBuffer {
 
     fn draw(
         &mut self,
-        geometry: &GeometryBuffer,
+        geometry: &dyn GeometryBuffer,
         viewport: Rect<i32>,
         program: &dyn GpuProgram,
         params: &DrawParameters,
@@ -314,26 +369,84 @@ impl FrameBuffer for GlFrameBuffer {
         element_range: ElementRange,
     ) -> Result<DrawCallStatistics, FrameworkError> {
         let server = self.state.upgrade().unwrap();
+        let geometry = geometry
+            .as_any()
+            .downcast_ref::<GlGeometryBuffer>()
+            .unwrap();
 
         pre_draw(self.id(), &server, viewport, program, params, resources);
 
-        geometry.bind(&server).draw(element_range)
+        let (offset, count) = match element_range {
+            ElementRange::Full => (0, geometry.element_count.get()),
+            ElementRange::Specific { offset, count } => (offset, count),
+        };
+
+        let last_triangle_index = offset + count;
+
+        if last_triangle_index > geometry.element_count.get() {
+            Err(FrameworkError::InvalidElementRange {
+                start: offset,
+                end: last_triangle_index,
+                total: geometry.element_count.get(),
+            })
+        } else {
+            let index_per_element = geometry.element_kind.index_per_element();
+            let start_index = offset * index_per_element;
+            let index_count = count * index_per_element;
+
+            unsafe {
+                if index_count > 0 {
+                    server.set_vertex_array_object(Some(geometry.vertex_array_object));
+
+                    let indices = (start_index * size_of::<u32>()) as i32;
+                    server.gl.draw_elements(
+                        geometry.mode(),
+                        index_count as i32,
+                        glow::UNSIGNED_INT,
+                        indices,
+                    );
+                }
+            }
+
+            Ok(DrawCallStatistics { triangles: count })
+        }
     }
 
     fn draw_instances(
         &mut self,
         count: usize,
-        geometry: &GeometryBuffer,
+        geometry: &dyn GeometryBuffer,
         viewport: Rect<i32>,
         program: &dyn GpuProgram,
         params: &DrawParameters,
         resources: &[ResourceBindGroup],
     ) -> DrawCallStatistics {
         let server = self.state.upgrade().unwrap();
+        let geometry = geometry
+            .as_any()
+            .downcast_ref::<GlGeometryBuffer>()
+            .unwrap();
 
         pre_draw(self.id(), &server, viewport, program, params, resources);
 
-        geometry.bind(&server).draw_instances(count)
+        let index_per_element = geometry.element_kind.index_per_element();
+        let index_count = geometry.element_count.get() * index_per_element;
+        if index_count > 0 {
+            unsafe {
+                server.set_vertex_array_object(Some(geometry.vertex_array_object));
+
+                server.gl.draw_elements_instanced(
+                    geometry.mode(),
+                    index_count as i32,
+                    glow::UNSIGNED_INT,
+                    0,
+                    count as i32,
+                )
+            }
+        }
+        DrawCallStatistics {
+            triangles: geometry.element_count.get() * count,
+        }
     }
 }
 
@@ -373,6 +486,7 @@ fn pre_draw(
                 ResourceBinding::Buffer {
                     buffer,
                     shader_location,
+                    data_usage: data_location,
                 } => {
                     let gl_buffer = buffer
                         .as_any()
@@ -380,11 +494,25 @@ fn pre_draw(
                         .expect("Must be OpenGL buffer");
 
                     unsafe {
-                        server.gl.bind_buffer_base(
-                            gl_buffer.kind().into_gl(),
-                            buffer_binding,
-                            Some(gl_buffer.id),
-                        );
+                        match data_location {
+                            BufferDataUsage::UseSegment { offset, size } => {
+                                assert_ne!(*size, 0);
+                                server.gl.bind_buffer_range(
+                                    gl_buffer.kind().into_gl(),
+                                    buffer_binding,
+                                    Some(gl_buffer.id),
+                                    *offset as i32,
+                                    *size as i32,
+                                );
+                            }
+                            BufferDataUsage::UseEverything => {
+                                server.gl.bind_buffer_base(
+                                    gl_buffer.kind().into_gl(),
+                                    buffer_binding,
+                                    Some(gl_buffer.id),
+                                );
+                            }
+                        }
 
                         match gl_buffer.kind() {
                             BufferKind::Uniform => server.gl.uniform_block_binding(

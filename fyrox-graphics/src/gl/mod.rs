@@ -20,8 +20,10 @@
 
 pub mod buffer;
 pub mod framebuffer;
+pub mod geometry_buffer;
 pub mod program;
 pub mod query;
+pub mod read_buffer;
 pub mod server;
 pub mod texture;
 
