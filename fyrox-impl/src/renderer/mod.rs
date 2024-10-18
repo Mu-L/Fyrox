@@ -51,7 +51,6 @@ mod skybox_shader;
 mod ssao;
 mod stats;
 
-use crate::renderer::cache::uniform::UniformMemoryAllocator;
 use crate::{
     asset::{event::ResourceEvent, manager::ResourceManager},
     core::{
@@ -72,10 +71,10 @@ use crate::{
     material::shader::{Shader, ShaderResource, ShaderResourceExtension},
     renderer::{
         bloom::BloomRenderer,
-        bundle::{ObserverInfo, RenderDataBundleStorage},
+        bundle::{ObserverInfo, RenderDataBundleStorage, RenderDataBundleStorageOptions},
         cache::{
             geometry::GeometryCache, shader::ShaderCache, texture::TextureCache,
-            uniform::UniformBufferCache,
+            uniform::UniformBufferCache, uniform::UniformMemoryAllocator,
         },
         debug_renderer::DebugRenderer,
         flat_shader::FlatShader,
@@ -107,9 +106,10 @@ use crate::{
     scene::{camera::Camera, mesh::surface::SurfaceData, Scene, SceneContainer},
 };
 use fxhash::FxHashMap;
-use fyrox_graphics::framebuffer::BufferLocation;
-use fyrox_graphics::gl::server::GlGraphicsServer;
-use fyrox_graphics::server::SharedGraphicsServer;
+use fyrox_graphics::{
+    framebuffer::BufferLocation, gl::server::GlGraphicsServer, gpu_program::SamplerFallback,
+    server::SharedGraphicsServer,
+};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 pub use stats::*;
@@ -649,25 +649,52 @@ pub(crate) fn make_viewport_matrix(viewport: Rect<i32>) -> Matrix4<f32> {
     ))
 }
 
+/// A set of textures of certain kinds that could be used as a stub in cases when you don't have
+/// your own texture of this kind.
+pub struct FallbackResources {
+    /// White, one pixel, texture which will be used as stub when rendering something without
+    /// a texture specified.
+    pub white_dummy: Rc<RefCell<dyn GpuTexture>>,
+    /// Black, one pixel, texture.
+    pub black_dummy: Rc<RefCell<dyn GpuTexture>>,
+    /// A cube map with 6 textures of 1x1 black pixel in size.
+    pub environment_dummy: Rc<RefCell<dyn GpuTexture>>,
+    /// One pixel texture with (0, 1, 0) vector is used as stub when rendering something without a
+    /// normal map.
+    pub normal_dummy: Rc<RefCell<dyn GpuTexture>>,
+    /// One pixel texture used as stub when rendering something without a  metallic texture. Default
+    /// metalness is 0.0
+    pub metallic_dummy: Rc<RefCell<dyn GpuTexture>>,
+    /// One pixel volume texture.
+    pub volume_dummy: Rc<RefCell<dyn GpuTexture>>,
+    /// A stub uniform buffer for situation when there's no actual bone matrices.
+    pub bone_matrices_stub_uniform_buffer: Box<dyn Buffer>,
+}
+
+impl FallbackResources {
+    /// Picks a texture that corresponds to the actual value of the given sampler fallback.
+    pub fn sampler_fallback(
+        &self,
+        sampler_fallback: SamplerFallback,
+    ) -> &Rc<RefCell<dyn GpuTexture>> {
+        match sampler_fallback {
+            SamplerFallback::White => &self.white_dummy,
+            SamplerFallback::Normal => &self.normal_dummy,
+            SamplerFallback::Black => &self.black_dummy,
+            SamplerFallback::Volume => &self.volume_dummy,
+        }
+    }
+}
+
 /// See module docs.
 pub struct Renderer {
     backbuffer: Box<dyn FrameBuffer>,
     scene_render_passes: Vec<Rc<RefCell<dyn SceneRenderPass>>>,
     deferred_light_renderer: DeferredLightRenderer,
     flat_shader: FlatShader,
-    /// Dummy white one pixel texture which will be used as stub when rendering
-    /// something without texture specified.
-    pub white_dummy: Rc<RefCell<dyn GpuTexture>>,
-    black_dummy: Rc<RefCell<dyn GpuTexture>>,
-    environment_dummy: Rc<RefCell<dyn GpuTexture>>,
-    // Dummy one pixel texture with (0, 1, 0) vector is used as stub when rendering
-    // something without normal map.
-    normal_dummy: Rc<RefCell<dyn GpuTexture>>,
-    // Dummy one pixel texture used as stub when rendering something without a
-    // metallic texture. Default metalness is 0.0
-    metallic_dummy: Rc<RefCell<dyn GpuTexture>>,
-    // Dummy, one pixel, volume texture.
-    volume_dummy: Rc<RefCell<dyn GpuTexture>>,
+    /// A set of textures of certain kinds that could be used as a stub in cases when you don't have
+    /// your own texture of this kind.
+    pub fallback_resources: FallbackResources,
     /// User interface renderer.
     pub ui_renderer: UiRenderer,
     statistics: Statistics,
@@ -697,8 +724,6 @@ pub struct Renderer {
     // like ones used to render UI instances.
     ui_frame_buffers: FxHashMap<u64, Box<dyn FrameBuffer>>,
     uniform_memory_allocator: UniformMemoryAllocator,
-    /// A stub uniform buffer for situation when there's no actual bone matrices.
-    pub bone_matrices_stub_uniform_buffer: Box<dyn Buffer>,
     /// Visibility cache based on occlusion query.
     pub visibility_cache: VisibilityCache,
     /// Graphics server.
@@ -786,26 +811,9 @@ pub struct SceneRenderPassContext<'a, 'b> {
     /// A handle of the scene being rendered.
     pub scene_handle: Handle<Scene>,
 
-    /// An 1x1 white pixel texture that could be used a stub when there is no texture.
-    pub white_dummy: Rc<RefCell<dyn GpuTexture>>,
-
-    /// An 1x1 pixel texture with (0, 1, 0) vector that could be used a stub when
-    /// there is no normal map.
-    pub normal_dummy: Rc<RefCell<dyn GpuTexture>>,
-
-    /// An 1x1 pixel with 0.0 metalness factor texture that could be used a stub when
-    /// there is no metallic map.
-    pub metallic_dummy: Rc<RefCell<dyn GpuTexture>>,
-
-    /// An 1x1 black cube map texture that could be used a stub when there is no environment
-    /// texture.
-    pub environment_dummy: Rc<RefCell<dyn GpuTexture>>,
-
-    /// An 1x1 black pixel texture that could be used a stub when there is no texture.
-    pub black_dummy: Rc<RefCell<dyn GpuTexture>>,
-
-    /// A dummy 1x1x1 pixel volume texture.
-    pub volume_dummy: Rc<RefCell<dyn GpuTexture>>,
+    /// A set of textures of certain kinds that could be used as a stub in cases when you don't have
+    /// your own texture of this kind.
+    pub fallback_resources: &'a FallbackResources,
 
     /// A texture with depth values from G-Buffer.
     ///
@@ -837,9 +845,6 @@ pub struct SceneRenderPassContext<'a, 'b> {
 
     /// A cache of uniform buffers.
     pub uniform_buffer_cache: &'a mut UniformBufferCache,
-
-    /// A stub uniform buffer with bone matrices.
-    pub bone_matrices_stub_uniform_buffer: &'a dyn Buffer,
 
     /// Memory allocator for uniform buffers that tries to pack uniforms densely into large uniform
     /// buffers, giving you offsets to the data.
@@ -991,11 +996,7 @@ impl Renderer {
             caps.uniform_buffer_offset_alignment,
         );
 
-        let renderer = Self {
-            backbuffer: server.back_buffer(),
-            frame_size,
-            deferred_light_renderer: DeferredLightRenderer::new(&*server, frame_size, &settings)?,
-            flat_shader: FlatShader::new(&*server)?,
+        let fallback_resources = FallbackResources {
             white_dummy: server.create_texture(
                 GpuTextureKind::Rectangle {
                     width: 1,
@@ -1070,11 +1071,6 @@ impl Renderer {
                 1,
                 Some(&[0u8, 0u8, 0u8, 0u8]),
             )?,
-            quad: <dyn GeometryBuffer>::from_surface_data(
-                &SurfaceData::make_unit_xy_quad(),
-                BufferUsage::StaticDraw,
-                &*server,
-            )?,
             bone_matrices_stub_uniform_buffer: {
                 let buffer = server.create_buffer(
                     MAX_BONE_MATRICES * size_of::<Matrix4<f32>>(),
@@ -1086,6 +1082,20 @@ impl Renderer {
                 buffer.write_data(array_as_u8_slice(&zeros))?;
                 buffer
             },
+        };
+
+        let renderer = Self {
+            backbuffer: server.back_buffer(),
+            frame_size,
+            deferred_light_renderer: DeferredLightRenderer::new(&*server, frame_size, &settings)?,
+            flat_shader: FlatShader::new(&*server)?,
+            fallback_resources,
+            quad: <dyn GeometryBuffer>::from_surface_data(
+                &SurfaceData::make_unit_xy_quad(),
+                BufferUsage::StaticDraw,
+                &*server,
+            )?,
+
             ui_renderer: UiRenderer::new(&*server)?,
             quality_settings: settings,
             debug_renderer: DebugRenderer::new(&*server)?,
@@ -1264,7 +1274,7 @@ impl Renderer {
             frame_width: screen_size.x,
             frame_height: screen_size.y,
             drawing_context,
-            white_dummy: self.white_dummy.clone(),
+            fallback_resources: &self.fallback_resources,
             texture_cache: &mut self.texture_cache,
             uniform_buffer_cache: &mut self.uniform_buffer_cache,
             flat_shader: &self.flat_shader,
@@ -1441,6 +1451,9 @@ impl Renderer {
                     projection_matrix: camera.projection_matrix(),
                 },
                 GBUFFER_PASS_NAME.clone(),
+                RenderDataBundleStorageOptions {
+                    collect_lights: true,
+                },
             );
 
             server.set_polygon_fill_mode(
@@ -1457,13 +1470,9 @@ impl Renderer {
                     texture_cache: &mut self.texture_cache,
                     shader_cache: &mut self.shader_cache,
                     quality_settings: &self.quality_settings,
-                    normal_dummy: self.normal_dummy.clone(),
-                    white_dummy: self.white_dummy.clone(),
-                    black_dummy: self.black_dummy.clone(),
-                    volume_dummy: self.volume_dummy.clone(),
+                    fallback_resources: &self.fallback_resources,
                     graph,
                     uniform_buffer_cache: &mut self.uniform_buffer_cache,
-                    bone_matrices_stub_uniform_buffer: &*self.bone_matrices_stub_uniform_buffer,
                     uniform_memory_allocator: &mut self.uniform_memory_allocator,
                     screen_space_debug_renderer: &mut self.screen_space_debug_renderer,
                     unit_quad: &*self.quad,
@@ -1492,18 +1501,15 @@ impl Renderer {
                         scene,
                         camera,
                         gbuffer: &mut scene_associated_data.gbuffer,
-                        white_dummy: self.white_dummy.clone(),
                         ambient_color: scene.rendering_options.ambient_lighting_color,
+                        render_data_bundle: &bundle_storage,
                         settings: &self.quality_settings,
                         textures: &mut self.texture_cache,
                         geometry_cache: &mut self.geometry_cache,
                         frame_buffer: &mut *scene_associated_data.hdr_scene_framebuffer,
                         shader_cache: &mut self.shader_cache,
-                        normal_dummy: self.normal_dummy.clone(),
-                        black_dummy: self.black_dummy.clone(),
-                        volume_dummy: self.volume_dummy.clone(),
+                        fallback_resources: &self.fallback_resources,
                         uniform_buffer_cache: &mut self.uniform_buffer_cache,
-                        bone_matrices_stub_uniform_buffer: &*self.bone_matrices_stub_uniform_buffer,
                         visibility_cache,
                         uniform_memory_allocator: &mut self.uniform_memory_allocator,
                     })?;
@@ -1516,7 +1522,6 @@ impl Renderer {
             scene_associated_data.statistics +=
                 self.forward_renderer.render(ForwardRenderContext {
                     state: server,
-                    graph,
                     camera,
                     geom_cache: &mut self.geometry_cache,
                     texture_cache: &mut self.texture_cache,
@@ -1525,14 +1530,10 @@ impl Renderer {
                     framebuffer: &mut *scene_associated_data.hdr_scene_framebuffer,
                     viewport,
                     quality_settings: &self.quality_settings,
-                    white_dummy: self.white_dummy.clone(),
-                    normal_dummy: self.normal_dummy.clone(),
-                    black_dummy: self.black_dummy.clone(),
-                    volume_dummy: self.volume_dummy.clone(),
+                    fallback_resources: &self.fallback_resources,
                     scene_depth: depth,
                     uniform_buffer_cache: &mut self.uniform_buffer_cache,
                     ambient_light: scene.rendering_options.ambient_lighting_color,
-                    bone_matrices_stub_uniform_buffer: &*self.bone_matrices_stub_uniform_buffer,
                     uniform_memory_allocator: &mut self.uniform_memory_allocator,
                 })?;
 
@@ -1551,20 +1552,13 @@ impl Renderer {
                             scene,
                             camera,
                             scene_handle,
-                            white_dummy: self.white_dummy.clone(),
-                            normal_dummy: self.normal_dummy.clone(),
-                            metallic_dummy: self.metallic_dummy.clone(),
-                            environment_dummy: self.environment_dummy.clone(),
-                            black_dummy: self.black_dummy.clone(),
-                            volume_dummy: self.volume_dummy.clone(),
+                            fallback_resources: &self.fallback_resources,
                             depth_texture: scene_associated_data.gbuffer.depth(),
                             normal_texture: scene_associated_data.gbuffer.normal_texture(),
                             ambient_texture: scene_associated_data.gbuffer.ambient_texture(),
                             framebuffer: &mut *scene_associated_data.hdr_scene_framebuffer,
                             ui_renderer: &mut self.ui_renderer,
                             uniform_buffer_cache: &mut self.uniform_buffer_cache,
-                            bone_matrices_stub_uniform_buffer: &*self
-                                .bone_matrices_stub_uniform_buffer,
                             uniform_memory_allocator: &mut self.uniform_memory_allocator,
                         })?;
             }
@@ -1639,20 +1633,13 @@ impl Renderer {
                             scene,
                             camera,
                             scene_handle,
-                            white_dummy: self.white_dummy.clone(),
-                            normal_dummy: self.normal_dummy.clone(),
-                            metallic_dummy: self.metallic_dummy.clone(),
-                            environment_dummy: self.environment_dummy.clone(),
-                            black_dummy: self.black_dummy.clone(),
-                            volume_dummy: self.volume_dummy.clone(),
+                            fallback_resources: &self.fallback_resources,
                             depth_texture: scene_associated_data.gbuffer.depth(),
                             normal_texture: scene_associated_data.gbuffer.normal_texture(),
                             ambient_texture: scene_associated_data.gbuffer.ambient_texture(),
                             framebuffer: &mut *scene_associated_data.ldr_scene_framebuffer,
                             ui_renderer: &mut self.ui_renderer,
                             uniform_buffer_cache: &mut self.uniform_buffer_cache,
-                            bone_matrices_stub_uniform_buffer: &*self
-                                .bone_matrices_stub_uniform_buffer,
                             uniform_memory_allocator: &mut self.uniform_memory_allocator,
                         })?;
             }
@@ -1731,7 +1718,7 @@ impl Renderer {
                 frame_width: backbuffer_width,
                 frame_height: backbuffer_height,
                 drawing_context,
-                white_dummy: self.white_dummy.clone(),
+                fallback_resources: &self.fallback_resources,
                 texture_cache: &mut self.texture_cache,
                 uniform_buffer_cache: &mut self.uniform_buffer_cache,
                 flat_shader: &self.flat_shader,

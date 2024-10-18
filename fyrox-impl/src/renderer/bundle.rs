@@ -20,21 +20,24 @@
 
 //! The module responsible for bundle generation for rendering optimizations.
 
-use crate::material::MaterialPropertyGroup;
+#![allow(missing_docs)] // TODO
+
 use crate::{
     asset::untyped::ResourceKind,
     core::{
-        algebra::Vector4,
-        algebra::{Matrix4, Vector3},
+        algebra::{Matrix4, Vector3, Vector4},
         arrayvec::ArrayVec,
+        color,
         color::Color,
+        log::Log,
         math::{frustum::Frustum, Rect},
         pool::Handle,
         sstorage::ImmutableString,
     },
     graph::BaseSceneGraph,
-    material,
-    material::{shader::SamplerFallback, MaterialProperty, MaterialResource},
+    material::{
+        self, shader::ShaderDefinition, MaterialProperty, MaterialPropertyGroup, MaterialResource,
+    },
     renderer::{
         cache::{
             geometry::GeometryCache,
@@ -44,18 +47,26 @@ use crate::{
             TimeToLive,
         },
         framework::{
-            buffer::Buffer,
             error::FrameworkError,
-            framebuffer::{FrameBuffer, ResourceBindGroup, ResourceBinding},
+            framebuffer::{BufferLocation, FrameBuffer, ResourceBindGroup, ResourceBinding},
+            gpu_program::{ShaderProperty, ShaderPropertyKind, ShaderResourceKind},
             gpu_texture::GpuTexture,
             server::GraphicsServer,
             uniform::StaticUniformBuffer,
+            uniform::{ByteStorage, UniformBuffer},
             ElementRange,
         },
-        LightData, RenderPassStatistics, MAX_BONE_MATRICES,
+        FallbackResources, LightData, RenderPassStatistics, MAX_BONE_MATRICES,
     },
+    resource::texture::TextureResource,
     scene::{
         graph::Graph,
+        light::{
+            directional::{CsmOptions, DirectionalLight},
+            point::PointLight,
+            spot::SpotLight,
+            BaseLight,
+        },
         mesh::{
             buffer::{
                 BytesStorage, TriangleBuffer, TriangleBufferRefMut, VertexAttributeDescriptor,
@@ -68,11 +79,7 @@ use crate::{
     },
 };
 use fxhash::{FxBuildHasher, FxHashMap, FxHasher};
-use fyrox_core::color;
-use fyrox_core::log::Log;
-use fyrox_graphics::framebuffer::BufferLocation;
-use fyrox_graphics::gpu_program::{ShaderProperty, ShaderPropertyKind, ShaderResourceKind};
-use fyrox_graphics::uniform::{ByteStorage, UniformBuffer};
+use fyrox_graph::{SceneGraph, SceneGraphNode};
 use std::{
     cell::RefCell,
     collections::hash_map::DefaultHasher,
@@ -83,6 +90,7 @@ use std::{
 
 /// Observer info contains all the data, that describes an observer. It could be a real camera, light source's
 /// "virtual camera" that is used for shadow mapping, etc.
+#[derive(Clone, Default)]
 pub struct ObserverInfo {
     /// World-space position of the observer.
     pub observer_position: Vector3<f32>,
@@ -144,14 +152,12 @@ pub struct BundleRenderContext<'a> {
     pub frame_buffer: &'a mut dyn FrameBuffer,
     pub viewport: Rect<i32>,
     pub uniform_buffer_cache: &'a mut UniformBufferCache,
-    pub bone_matrices_stub_uniform_buffer: &'a dyn Buffer,
     pub uniform_memory_allocator: &'a mut UniformMemoryAllocator,
 
     // Built-in uniforms.
     pub view_projection_matrix: &'a Matrix4<f32>,
     pub use_pom: bool,
     pub light_position: &'a Vector3<f32>,
-    pub light_data: Option<&'a LightData>,
     pub ambient_light: Color,
     // TODO: Add depth pre-pass to remove Option here. Current architecture allows only forward
     // renderer to have access to depth buffer that is available from G-Buffer.
@@ -163,11 +169,7 @@ pub struct BundleRenderContext<'a> {
     pub z_near: f32,
     pub z_far: f32,
 
-    // Fallback textures.
-    pub normal_dummy: &'a Rc<RefCell<dyn GpuTexture>>,
-    pub white_dummy: &'a Rc<RefCell<dyn GpuTexture>>,
-    pub black_dummy: &'a Rc<RefCell<dyn GpuTexture>>,
-    pub volume_dummy: &'a Rc<RefCell<dyn GpuTexture>>,
+    pub fallback_resources: &'a FallbackResources,
 }
 
 /// Persistent identifier marks drawing data, telling the renderer that the data is the same, no matter from which
@@ -249,16 +251,19 @@ pub struct InstanceUniformData {
 pub struct BundleUniformData {
     /// Material info block location.
     pub material_property_group_blocks: Vec<(usize, UniformBlockLocation)>,
-    /// Camera info block location.
-    pub camera_block: UniformBlockLocation,
     /// Lights info block location.
-    pub lights_block: Option<UniformBlockLocation>,
-    /// Light source data info block location.
     pub light_data_block: UniformBlockLocation,
-    /// Graphics settings block location.
-    pub graphics_settings_block: UniformBlockLocation,
     /// Block locations for each instance in a bundle.
     pub instance_blocks: Vec<InstanceUniformData>,
+}
+
+pub struct GlobalUniformData {
+    /// Camera info block location.
+    pub camera_block: UniformBlockLocation,
+    /// Light source data info block location.
+    pub lights_block: UniformBlockLocation,
+    /// Graphics settings block location.
+    pub graphics_settings_block: UniformBlockLocation,
 }
 
 fn write_with_material<T: ByteStorage>(
@@ -413,44 +418,10 @@ impl RenderDataBundle {
             ))
         }
 
-        // Upload camera uniforms.
-        let camera_uniforms = StaticUniformBuffer::<512>::new()
-            .with(render_context.view_projection_matrix)
-            .with(render_context.camera_position)
-            .with(render_context.camera_up_vector)
-            .with(render_context.camera_side_vector)
-            .with(&render_context.z_near)
-            .with(&render_context.z_far)
-            .with(&(render_context.z_far - render_context.z_near));
-        let camera_block = render_context
-            .uniform_memory_allocator
-            .allocate(camera_uniforms);
-
         let light_data = StaticUniformBuffer::<256>::new()
             .with(render_context.light_position)
             .with(&render_context.ambient_light.as_frgba());
         let light_data_block = render_context.uniform_memory_allocator.allocate(light_data);
-
-        let graphics_settings = StaticUniformBuffer::<256>::new().with(&render_context.use_pom);
-        let graphics_settings_block = render_context
-            .uniform_memory_allocator
-            .allocate(graphics_settings);
-
-        let lights_block = if let Some(light_data) = render_context.light_data {
-            let lights_data = StaticUniformBuffer::<2048>::new()
-                .with(&(light_data.count as i32))
-                .with_slice(&light_data.color_radius)
-                .with_slice(&light_data.parameters)
-                .with_slice(&light_data.position)
-                .with_slice(&light_data.direction);
-            Some(
-                render_context
-                    .uniform_memory_allocator
-                    .allocate(lights_data),
-            )
-        } else {
-            None
-        };
 
         // Upload instance uniforms.
         let mut instance_blocks = Vec::with_capacity(self.instances.len());
@@ -501,10 +472,7 @@ impl RenderDataBundle {
 
         Some(BundleUniformData {
             material_property_group_blocks,
-            camera_block,
-            lights_block,
             light_data_block,
-            graphics_settings_block,
             instance_blocks,
         })
     }
@@ -518,6 +486,7 @@ impl RenderDataBundle {
         instance_filter: &mut F,
         render_context: &mut BundleRenderContext,
         bundle_uniform_data: BundleUniformData,
+        global_uniform_data: &GlobalUniformData,
     ) -> Result<RenderPassStatistics, FrameworkError>
     where
         F: FnMut(&SurfaceInstanceData) -> bool,
@@ -557,7 +526,7 @@ impl RenderDataBundle {
                         if let Some(scene_depth) = render_context.scene_depth.as_ref() {
                             scene_depth
                         } else {
-                            render_context.black_dummy
+                            &render_context.fallback_resources.black_dummy
                         },
                         resource_definition.binding,
                     ));
@@ -565,7 +534,7 @@ impl RenderDataBundle {
                 "fyrox_cameraData" => {
                     material_bindings.push(
                         render_context.uniform_memory_allocator.block_to_binding(
-                            bundle_uniform_data.camera_block,
+                            global_uniform_data.camera_block,
                             resource_definition.binding,
                         ),
                     );
@@ -581,28 +550,22 @@ impl RenderDataBundle {
                 "fyrox_graphicsSettings" => {
                     material_bindings.push(
                         render_context.uniform_memory_allocator.block_to_binding(
-                            bundle_uniform_data.graphics_settings_block,
+                            global_uniform_data.graphics_settings_block,
                             resource_definition.binding,
                         ),
                     );
                 }
                 "fyrox_lightsBlock" => {
-                    if let Some(lights_block) = bundle_uniform_data.lights_block {
-                        material_bindings.push(
-                            render_context
-                                .uniform_memory_allocator
-                                .block_to_binding(lights_block, resource_definition.binding),
-                        );
-                    }
+                    material_bindings.push(
+                        render_context.uniform_memory_allocator.block_to_binding(
+                            global_uniform_data.lights_block,
+                            resource_definition.binding,
+                        ),
+                    );
                 }
                 _ => match resource_definition.kind {
                     ShaderResourceKind::Texture { fallback, .. } => {
-                        let fallback = match fallback {
-                            SamplerFallback::White => render_context.white_dummy,
-                            SamplerFallback::Normal => render_context.normal_dummy,
-                            SamplerFallback::Black => render_context.black_dummy,
-                            SamplerFallback::Volume => render_context.volume_dummy,
-                        };
+                        let fallback = render_context.fallback_resources.sampler_fallback(fallback);
 
                         let texture = if let Some(binding) =
                             material.binding_ref(resource_definition.name.clone())
@@ -683,7 +646,9 @@ impl RenderDataBundle {
                                 // Bind stub buffer, instead of creating and uploading 16kb with zeros per draw
                                 // call.
                                 instance_bindings.push(ResourceBinding::Buffer {
-                                    buffer: render_context.bone_matrices_stub_uniform_buffer,
+                                    buffer: &*render_context
+                                        .fallback_resources
+                                        .bone_matrices_stub_uniform_buffer,
                                     binding: BufferLocation::Explicit {
                                         binding: resource_definition.binding,
                                     },
@@ -763,6 +728,40 @@ pub trait RenderDataBundleStorageTrait {
     );
 }
 
+pub enum LightSourceKind {
+    Spot {
+        full_cone_angle: f32,
+        hotspot_cone_angle: f32,
+        distance: f32,
+        shadow_bias: f32,
+        cookie_texture: Option<TextureResource>,
+    },
+    Point {
+        radius: f32,
+        shadow_bias: f32,
+    },
+    Directional {
+        csm_options: CsmOptions,
+    },
+    Unknown,
+}
+
+pub struct LightSource {
+    pub handle: Handle<Node>,
+    pub global_transform: Matrix4<f32>,
+    pub kind: LightSourceKind,
+    pub position: Vector3<f32>,
+    pub up_vector: Vector3<f32>,
+    pub side_vector: Vector3<f32>,
+    pub look_vector: Vector3<f32>,
+    pub cast_shadows: bool,
+    pub local_scale: Vector3<f32>,
+    pub color: Color,
+    pub intensity: f32,
+    pub scatter_enabled: bool,
+    pub scatter: Vector3<f32>,
+}
+
 /// Bundle storage handles bundle generation for a scene before rendering. It is used to optimize
 /// rendering by reducing amount of state changes of OpenGL context.
 #[derive(Default)]
@@ -770,6 +769,19 @@ pub struct RenderDataBundleStorage {
     bundle_map: FxHashMap<u64, usize>,
     /// A sorted list of bundles.
     pub bundles: Vec<RenderDataBundle>,
+    pub light_sources: Vec<LightSource>,
+}
+
+pub struct RenderDataBundleStorageOptions {
+    pub collect_lights: bool,
+}
+
+impl Default for RenderDataBundleStorageOptions {
+    fn default() -> Self {
+        Self {
+            collect_lights: true,
+        }
+    }
 }
 
 impl RenderDataBundleStorage {
@@ -780,16 +792,23 @@ impl RenderDataBundleStorage {
         graph: &Graph,
         observer_info: ObserverInfo,
         render_pass_name: ImmutableString,
+        options: RenderDataBundleStorageOptions,
     ) -> Self {
         // Aim for the worst-case scenario when every node has unique render data.
         let capacity = graph.node_count() as usize;
         let mut storage = Self {
             bundle_map: FxHashMap::with_capacity_and_hasher(capacity, FxBuildHasher::default()),
             bundles: Vec::with_capacity(capacity),
+            light_sources: Default::default(),
         };
 
+        let frustum = Frustum::from_view_projection_matrix(
+            observer_info.projection_matrix * observer_info.view_matrix,
+        )
+        .unwrap_or_default();
+
         let mut lod_filter = vec![true; graph.capacity() as usize];
-        for node in graph.linear_iter() {
+        for (node_handle, node) in graph.pair_iter() {
             if let Some(lod_group) = node.lod_group() {
                 for level in lod_group.levels.iter() {
                     for &object in level.objects.iter() {
@@ -806,12 +825,55 @@ impl RenderDataBundleStorage {
                     }
                 }
             }
-        }
 
-        let frustum = Frustum::from_view_projection_matrix(
-            observer_info.projection_matrix * observer_info.view_matrix,
-        )
-        .unwrap_or_default();
+            if options.collect_lights {
+                if let Some(base_light) = node.component_ref::<BaseLight>() {
+                    if frustum.is_intersects_aabb(&node.world_bounding_box())
+                        && base_light.global_visibility()
+                        && base_light.is_globally_enabled()
+                    {
+                        let kind = if let Some(spot_light) = node.cast::<SpotLight>() {
+                            LightSourceKind::Spot {
+                                full_cone_angle: spot_light.full_cone_angle(),
+                                hotspot_cone_angle: spot_light.hotspot_cone_angle(),
+                                distance: spot_light.distance(),
+                                shadow_bias: spot_light.shadow_bias(),
+                                cookie_texture: spot_light.cookie_texture(),
+                            }
+                        } else if let Some(point_light) = node.cast::<PointLight>() {
+                            LightSourceKind::Point {
+                                radius: point_light.radius(),
+                                shadow_bias: point_light.shadow_bias(),
+                            }
+                        } else if let Some(directional_light) = node.cast::<DirectionalLight>() {
+                            LightSourceKind::Directional {
+                                csm_options: (*directional_light.csm_options).clone(),
+                            }
+                        } else {
+                            LightSourceKind::Unknown
+                        };
+
+                        let source = LightSource {
+                            handle: node_handle,
+                            global_transform: base_light.global_transform(),
+                            kind,
+                            position: base_light.global_position(),
+                            up_vector: base_light.up_vector(),
+                            side_vector: base_light.side_vector(),
+                            look_vector: base_light.look_vector(),
+                            cast_shadows: base_light.cast_shadows(),
+                            local_scale: **base_light.local_transform().scale(),
+                            color: base_light.color(),
+                            intensity: base_light.intensity(),
+                            scatter_enabled: base_light.is_scatter_enabled(),
+                            scatter: base_light.scatter(),
+                        };
+
+                        storage.light_sources.push(source);
+                    }
+                }
+            }
+        }
 
         let mut ctx = RenderContext {
             observer_position: &observer_info.observer_position,
@@ -854,6 +916,86 @@ impl RenderDataBundleStorage {
         self.bundles.sort_unstable_by_key(|b| b.sort_index);
     }
 
+    pub fn write_global_uniform_blocks(
+        &self,
+        render_context: &mut BundleRenderContext,
+    ) -> GlobalUniformData {
+        let mut light_data = LightData::<{ ShaderDefinition::MAX_LIGHTS }>::default();
+
+        for (i, light) in self
+            .light_sources
+            .iter()
+            .enumerate()
+            .take(ShaderDefinition::MAX_LIGHTS)
+        {
+            let color = light.color.as_frgb();
+
+            light_data.color_radius[i] = Vector4::new(color.x, color.y, color.z, 0.0);
+            light_data.position[i] = light.position;
+            light_data.direction[i] = light.up_vector;
+
+            match light.kind {
+                LightSourceKind::Spot {
+                    full_cone_angle,
+                    hotspot_cone_angle,
+                    distance,
+                    ..
+                } => {
+                    light_data.color_radius[i].w = distance;
+                    light_data.parameters[i].x = (hotspot_cone_angle * 0.5).cos();
+                    light_data.parameters[i].y = (full_cone_angle * 0.5).cos();
+                }
+                LightSourceKind::Point { radius, .. } => {
+                    light_data.color_radius[i].w = radius;
+                    light_data.parameters[i].x = std::f32::consts::PI.cos();
+                    light_data.parameters[i].y = std::f32::consts::PI.cos();
+                }
+                LightSourceKind::Directional { .. } => {
+                    light_data.color_radius[i].w = f32::INFINITY;
+                    light_data.parameters[i].x = std::f32::consts::PI.cos();
+                    light_data.parameters[i].y = std::f32::consts::PI.cos();
+                }
+                LightSourceKind::Unknown => {}
+            }
+
+            light_data.count += 1;
+        }
+
+        let lights_data = StaticUniformBuffer::<2048>::new()
+            .with(&(light_data.count as i32))
+            .with_slice(&light_data.color_radius)
+            .with_slice(&light_data.parameters)
+            .with_slice(&light_data.position)
+            .with_slice(&light_data.direction);
+        let lights_block = render_context
+            .uniform_memory_allocator
+            .allocate(lights_data);
+
+        // Upload camera uniforms.
+        let camera_uniforms = StaticUniformBuffer::<512>::new()
+            .with(render_context.view_projection_matrix)
+            .with(render_context.camera_position)
+            .with(render_context.camera_up_vector)
+            .with(render_context.camera_side_vector)
+            .with(&render_context.z_near)
+            .with(&render_context.z_far)
+            .with(&(render_context.z_far - render_context.z_near));
+        let camera_block = render_context
+            .uniform_memory_allocator
+            .allocate(camera_uniforms);
+
+        let graphics_settings = StaticUniformBuffer::<256>::new().with(&render_context.use_pom);
+        let graphics_settings_block = render_context
+            .uniform_memory_allocator
+            .allocate(graphics_settings);
+
+        GlobalUniformData {
+            camera_block,
+            lights_block,
+            graphics_settings_block,
+        }
+    }
+
     /// Draws the entire bundle set to the specified frame buffer with the specified rendering environment.
     pub fn render_to_frame_buffer<BundleFilter, InstanceFilter>(
         &self,
@@ -868,6 +1010,8 @@ impl RenderDataBundleStorage {
         BundleFilter: FnMut(&RenderDataBundle) -> bool,
         InstanceFilter: FnMut(&SurfaceInstanceData) -> bool,
     {
+        let global_uniforms = self.write_global_uniform_blocks(&mut render_context);
+
         let mut bundle_uniform_data_set = Vec::with_capacity(self.bundles.len());
         for bundle in self.bundles.iter() {
             if !bundle_filter(bundle) {
@@ -892,6 +1036,7 @@ impl RenderDataBundleStorage {
                     &mut instance_filter,
                     &mut render_context,
                     bundle_uniform_data,
+                    &global_uniforms,
                 )?
             }
         }

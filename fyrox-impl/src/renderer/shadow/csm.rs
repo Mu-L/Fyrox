@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use crate::renderer::cache::uniform::{UniformBufferCache, UniformMemoryAllocator};
+use crate::renderer::bundle::{LightSource, LightSourceKind, RenderDataBundleStorageOptions};
 use crate::{
     core::{
         algebra::{Matrix4, Point3, Vector2, Vector3},
@@ -27,9 +27,13 @@ use crate::{
     },
     renderer::{
         bundle::{BundleRenderContext, ObserverInfo, RenderDataBundleStorage},
-        cache::{geometry::GeometryCache, shader::ShaderCache, texture::TextureCache},
+        cache::{
+            geometry::GeometryCache,
+            shader::ShaderCache,
+            texture::TextureCache,
+            uniform::{UniformBufferCache, UniformMemoryAllocator},
+        },
         framework::{
-            buffer::Buffer,
             error::FrameworkError,
             framebuffer::{Attachment, AttachmentKind, FrameBuffer},
             gpu_texture::{
@@ -38,12 +42,12 @@ use crate::{
             },
             server::GraphicsServer,
         },
-        RenderPassStatistics, ShadowMapPrecision, DIRECTIONAL_SHADOW_PASS_NAME,
+        FallbackResources, RenderPassStatistics, ShadowMapPrecision, DIRECTIONAL_SHADOW_PASS_NAME,
     },
     scene::{
         camera::Camera,
         graph::Graph,
-        light::directional::{DirectionalLight, FrustumSplitOptions, CSM_NUM_CASCADES},
+        light::directional::{FrustumSplitOptions, CSM_NUM_CASCADES},
     },
 };
 use std::{cell::RefCell, rc::Rc};
@@ -116,17 +120,13 @@ pub(crate) struct CsmRenderContext<'a, 'c> {
     pub frame_size: Vector2<f32>,
     pub state: &'a dyn GraphicsServer,
     pub graph: &'c Graph,
-    pub light: &'c DirectionalLight,
+    pub light: &'c LightSource,
     pub camera: &'c Camera,
     pub geom_cache: &'a mut GeometryCache,
     pub shader_cache: &'a mut ShaderCache,
     pub texture_cache: &'a mut TextureCache,
-    pub normal_dummy: Rc<RefCell<dyn GpuTexture>>,
-    pub white_dummy: Rc<RefCell<dyn GpuTexture>>,
-    pub black_dummy: Rc<RefCell<dyn GpuTexture>>,
-    pub volume_dummy: Rc<RefCell<dyn GpuTexture>>,
+    pub fallback_resources: &'a FallbackResources,
     pub uniform_buffer_cache: &'a mut UniformBufferCache,
-    pub bone_matrices_stub_uniform_buffer: &'a dyn Buffer,
     pub uniform_memory_allocator: &'a mut UniformMemoryAllocator,
 }
 
@@ -174,26 +174,26 @@ impl CsmRenderer {
             geom_cache,
             shader_cache,
             texture_cache,
-            normal_dummy,
-            white_dummy,
-            black_dummy,
-            volume_dummy,
+            fallback_resources,
             uniform_buffer_cache,
-            bone_matrices_stub_uniform_buffer,
             uniform_memory_allocator,
         } = ctx;
 
+        let LightSourceKind::Directional { ref csm_options } = light.kind else {
+            return Ok(stats);
+        };
+
         let light_direction = -light
-            .up_vector()
+            .up_vector
             .try_normalize(f32::EPSILON)
             .unwrap_or_else(Vector3::y);
 
         let light_up_vec = light
-            .look_vector()
+            .look_vector
             .try_normalize(f32::EPSILON)
             .unwrap_or_else(Vector3::z);
 
-        let z_values = match light.csm_options.split_options {
+        let z_values = match csm_options.split_options {
             FrustumSplitOptions::Absolute { far_planes } => [
                 camera.projection().z_near(),
                 far_planes[0],
@@ -282,6 +282,9 @@ impl CsmRenderer {
                     projection_matrix: cascade_projection_matrix,
                 },
                 DIRECTIONAL_SHADOW_PASS_NAME.clone(),
+                RenderDataBundleStorageOptions {
+                    collect_lights: false,
+                },
             );
 
             stats += bundle_storage.render_to_frame_buffer(
@@ -296,7 +299,6 @@ impl CsmRenderer {
                     frame_buffer: framebuffer,
                     viewport,
                     uniform_buffer_cache,
-                    bone_matrices_stub_uniform_buffer,
                     uniform_memory_allocator,
                     view_projection_matrix: &light_view_projection,
                     camera_position: &camera.global_position(),
@@ -305,11 +307,7 @@ impl CsmRenderer {
                     z_near,
                     use_pom: false,
                     light_position: &Default::default(),
-                    normal_dummy: &normal_dummy,
-                    white_dummy: &white_dummy,
-                    black_dummy: &black_dummy,
-                    volume_dummy: &volume_dummy,
-                    light_data: None,            // TODO
+                    fallback_resources,
                     ambient_light: Color::WHITE, // TODO
                     scene_depth: None,
                     z_far,

@@ -18,6 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+use crate::renderer::bundle::RenderDataBundleStorageOptions;
+use crate::renderer::FallbackResources;
 use crate::{
     core::{
         algebra::{Matrix4, Point3, Vector3},
@@ -32,7 +34,6 @@ use crate::{
             uniform::{UniformBufferCache, UniformMemoryAllocator},
         },
         framework::{
-            buffer::Buffer,
             error::FrameworkError,
             framebuffer::{Attachment, AttachmentKind, FrameBuffer},
             gpu_texture::{
@@ -70,12 +71,8 @@ pub(crate) struct PointShadowMapRenderContext<'a> {
     pub cascade: usize,
     pub shader_cache: &'a mut ShaderCache,
     pub texture_cache: &'a mut TextureCache,
-    pub normal_dummy: Rc<RefCell<dyn GpuTexture>>,
-    pub white_dummy: Rc<RefCell<dyn GpuTexture>>,
-    pub black_dummy: Rc<RefCell<dyn GpuTexture>>,
-    pub volume_dummy: Rc<RefCell<dyn GpuTexture>>,
+    pub fallback_resources: &'a FallbackResources,
     pub uniform_buffer_cache: &'a mut UniformBufferCache,
-    pub bone_matrices_stub_uniform_buffer: &'a dyn Buffer,
     pub uniform_memory_allocator: &'a mut UniformMemoryAllocator,
 }
 
@@ -224,12 +221,8 @@ impl PointShadowMapRenderer {
             cascade,
             shader_cache,
             texture_cache,
-            normal_dummy,
-            white_dummy,
-            black_dummy,
-            volume_dummy,
+            fallback_resources,
             uniform_buffer_cache,
-            bone_matrices_stub_uniform_buffer,
             uniform_memory_allocator,
         } = args;
 
@@ -269,6 +262,9 @@ impl PointShadowMapRenderer {
                     projection_matrix: light_projection_matrix,
                 },
                 POINT_SHADOW_PASS_NAME.clone(),
+                RenderDataBundleStorageOptions {
+                    collect_lights: false,
+                },
             );
 
             statistics += bundle_storage.render_to_frame_buffer(
@@ -283,7 +279,6 @@ impl PointShadowMapRenderer {
                     frame_buffer: framebuffer,
                     viewport,
                     uniform_buffer_cache,
-                    bone_matrices_stub_uniform_buffer,
                     uniform_memory_allocator,
                     view_projection_matrix: &light_view_projection_matrix,
                     camera_position: &Default::default(),
@@ -292,11 +287,7 @@ impl PointShadowMapRenderer {
                     z_near,
                     use_pom: false,
                     light_position: &light_pos,
-                    normal_dummy: &normal_dummy,
-                    white_dummy: &white_dummy,
-                    black_dummy: &black_dummy,
-                    volume_dummy: &volume_dummy,
-                    light_data: None,            // TODO
+                    fallback_resources,
                     ambient_light: Color::WHITE, // TODO
                     scene_depth: None,
                     z_far,
