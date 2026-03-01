@@ -40,10 +40,12 @@ use crate::{
     utils::window_content,
     Message, Mode,
 };
+use fyrox::core::color::Color;
 use fyrox::gui::button::Button;
 use fyrox::gui::list_view::ListView;
 use fyrox::gui::utils::ImageButtonBuilder;
 use fyrox::gui::window::Window;
+use fyrox::gui::Orientation;
 
 pub struct CommandStackViewer {
     pub window: Handle<Window>,
@@ -60,10 +62,11 @@ impl CommandStackViewer {
         let undo;
         let redo;
         let clear;
-        let buttons = StackPanelBuilder::new(
+        let buttons_left = StackPanelBuilder::new(
             WidgetBuilder::new()
                 .with_child({
                     undo = ImageButtonBuilder::default()
+                        .with_image_color(Color::ORANGE_RED)
                         .with_image(load_image!("../../resources/undo.png"))
                         .with_tooltip("Undo The Command")
                         .with_tab_index(Some(0))
@@ -72,21 +75,38 @@ impl CommandStackViewer {
                 })
                 .with_child({
                     redo = ImageButtonBuilder::default()
+                        .with_image_color(Color::LIME_GREEN)
                         .with_image(load_image!("../../resources/redo.png"))
                         .with_tooltip("Redo The Command")
                         .with_tab_index(Some(1))
                         .build_button(ctx);
                     redo
-                })
-                .with_child({
-                    clear = ImageButtonBuilder::default()
-                        .with_image(load_image!("../../resources/clear.png"))
-                        .with_tooltip("Clear Command Stack\nChanges history will be erased.")
-                        .with_tab_index(Some(2))
-                        .build_button(ctx);
-                    clear
                 }),
         )
+        .with_orientation(Orientation::Horizontal)
+        .build(ctx);
+
+        let buttons_right = StackPanelBuilder::new(WidgetBuilder::new().on_column(2).with_child({
+            clear = ImageButtonBuilder::default()
+                .with_image_color(Color::ORANGE)
+                .with_image(load_image!("../../resources/clear.png"))
+                .with_tooltip("Clear Command Stack\nChanges history will be erased.")
+                .with_tab_index(Some(2))
+                .build_button(ctx);
+            clear
+        }))
+        .with_orientation(Orientation::Horizontal)
+        .build(ctx);
+
+        let buttons = GridBuilder::new(
+            WidgetBuilder::new()
+                .with_child(buttons_left)
+                .with_child(buttons_right),
+        )
+        .add_column(Column::auto())
+        .add_column(Column::stretch())
+        .add_column(Column::auto())
+        .add_row(Row::auto())
         .build(ctx);
 
         let window = WindowBuilder::new(WidgetBuilder::new().with_name("CommandStackPanel"))
@@ -98,7 +118,7 @@ impl CommandStackViewer {
                         ScrollViewerBuilder::new(
                             WidgetBuilder::new()
                                 .with_margin(Thickness::uniform(1.0))
-                                .on_column(1),
+                                .on_row(1),
                         )
                         .with_content({
                             list = ListViewBuilder::new(WidgetBuilder::new()).build(ctx);
@@ -107,8 +127,8 @@ impl CommandStackViewer {
                         .build(ctx),
                     ),
                 )
-                .add_column(Column::auto())
                 .add_column(Column::stretch())
+                .add_row(Row::auto())
                 .add_row(Row::stretch())
                 .build(ctx),
             )

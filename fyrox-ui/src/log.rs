@@ -121,6 +121,72 @@ impl LogPanel {
         let log_warning;
         let log_error;
         let scroll_viewer;
+
+        let buttons_left = StackPanelBuilder::new(
+            WidgetBuilder::new()
+                .with_horizontal_alignment(HorizontalAlignment::Left)
+                .on_row(0)
+                .on_column(0)
+                .with_child({
+                    log_info = ImageButtonBuilder::default()
+                        .with_tooltip("Enable or disable logging of information messages.")
+                        .with_image_color(Color::WHITE)
+                        .with_is_toggled(Log::is_logging_info())
+                        .with_image(resources::INFO.clone())
+                        .build_toggle(ctx);
+                    log_info
+                })
+                .with_child({
+                    log_warning = ImageButtonBuilder::default()
+                        .with_tooltip("Enable or disable logging of warning messages.")
+                        .with_image_color(Color::WHITE)
+                        .with_is_toggled(Log::is_logging_warning())
+                        .with_image(resources::WARNING.clone())
+                        .build_toggle(ctx);
+                    log_warning
+                })
+                .with_child({
+                    log_error = ImageButtonBuilder::default()
+                        .with_tooltip("Enable or disable logging of error messages.")
+                        .with_image_color(Color::WHITE)
+                        .with_is_toggled(Log::is_logging_error())
+                        .with_image(resources::ERROR.clone())
+                        .build_toggle(ctx);
+                    log_error
+                }),
+        )
+        .with_orientation(Orientation::Horizontal)
+        .build(ctx);
+
+        let buttons_right = StackPanelBuilder::new(
+            WidgetBuilder::new()
+                .with_horizontal_alignment(HorizontalAlignment::Left)
+                .on_row(0)
+                .on_column(2)
+                .with_child({
+                    clear = ImageButtonBuilder::default()
+                        .with_image(clear_icon)
+                        .with_image_color(Color::ORANGE)
+                        .with_tooltip("Clear the log.")
+                        .with_tab_index(Some(0))
+                        .build_button(ctx);
+                    clear
+                }),
+        )
+        .with_orientation(Orientation::Horizontal)
+        .build(ctx);
+
+        let buttons = GridBuilder::new(
+            WidgetBuilder::new()
+                .with_child(buttons_left)
+                .with_child(buttons_right),
+        )
+        .add_column(Column::auto())
+        .add_column(Column::stretch())
+        .add_column(Column::auto())
+        .add_row(Row::auto())
+        .build(ctx);
+
         let window = WindowBuilder::new(
             WidgetBuilder::new()
                 .with_width(400.0)
@@ -131,82 +197,25 @@ impl LogPanel {
         .with_title(WindowTitle::text("Message Log"))
         .with_tab_label("Log")
         .with_content(
-            GridBuilder::new(
-                WidgetBuilder::new()
-                    .with_child(
-                        StackPanelBuilder::new(
-                            WidgetBuilder::new()
-                                .with_horizontal_alignment(HorizontalAlignment::Left)
-                                .on_row(0)
-                                .on_column(0)
-                                .with_child({
-                                    clear = ImageButtonBuilder::default()
-                                        .with_image(clear_icon)
-                                        .with_tooltip("Clear the log.")
-                                        .with_tab_index(Some(0))
-                                        .build_button(ctx);
-                                    clear
-                                })
-                                .with_child({
-                                    log_info = ImageButtonBuilder::default()
-                                        .with_tooltip(
-                                            "Enable or disable logging of \
-                                            information messages.",
-                                        )
-                                        .with_image_color(Color::WHITE)
-                                        .with_is_toggled(Log::is_logging_info())
-                                        .with_image(resources::INFO.clone())
-                                        .build_toggle(ctx);
-                                    log_info
-                                })
-                                .with_child({
-                                    log_warning = ImageButtonBuilder::default()
-                                        .with_tooltip(
-                                            "Enable or disable logging of \
-                                        warning messages.",
-                                        )
-                                        .with_image_color(Color::WHITE)
-                                        .with_is_toggled(Log::is_logging_warning())
-                                        .with_image(resources::WARNING.clone())
-                                        .build_toggle(ctx);
-                                    log_warning
-                                })
-                                .with_child({
-                                    log_error = ImageButtonBuilder::default()
-                                        .with_tooltip(
-                                            "Enable or disable logging of \
-                                        error messages.",
-                                        )
-                                        .with_image_color(Color::WHITE)
-                                        .with_is_toggled(Log::is_logging_error())
-                                        .with_image(resources::ERROR.clone())
-                                        .build_toggle(ctx);
-                                    log_error
-                                }),
-                        )
-                        .with_orientation(Orientation::Horizontal)
-                        .build(ctx),
+            GridBuilder::new(WidgetBuilder::new().with_child(buttons).with_child({
+                scroll_viewer = ScrollViewerBuilder::new(
+                    WidgetBuilder::new()
+                        .on_row(1)
+                        .on_column(0)
+                        .with_margin(Thickness::uniform(3.0)),
+                )
+                .with_content({
+                    messages = StackPanelBuilder::new(
+                        WidgetBuilder::new().with_margin(Thickness::uniform(1.0)),
                     )
-                    .with_child({
-                        scroll_viewer = ScrollViewerBuilder::new(
-                            WidgetBuilder::new()
-                                .on_row(1)
-                                .on_column(0)
-                                .with_margin(Thickness::uniform(3.0)),
-                        )
-                        .with_content({
-                            messages = StackPanelBuilder::new(
-                                WidgetBuilder::new().with_margin(Thickness::uniform(1.0)),
-                            )
-                            .build(ctx);
-                            messages
-                        })
-                        .with_horizontal_scroll_allowed(true)
-                        .with_vertical_scroll_allowed(true)
-                        .build(ctx);
-                        scroll_viewer
-                    }),
-            )
+                    .build(ctx);
+                    messages
+                })
+                .with_horizontal_scroll_allowed(true)
+                .with_vertical_scroll_allowed(true)
+                .build(ctx);
+                scroll_viewer
+            }))
             .add_row(Row::auto())
             .add_row(Row::stretch())
             .add_column(Column::stretch())
