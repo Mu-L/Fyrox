@@ -22,7 +22,7 @@ use crate::{
     fyrox::core::{log::Log, reflect::prelude::*},
     settings::{
         build::BuildSettings, camera::CameraSettings, debugging::DebuggingSettings,
-        general::GeneralSettings, graphics::GraphicsSettings, keys::KeyBindings,
+        general::GeneralSettings, graphics::GraphicsSettings, keys::KeyBindings, log::LogSettings,
         model::ModelSettings, move_mode::MoveInteractionModeSettings, navmesh::NavmeshSettings,
         recent::RecentFiles, rotate_mode::RotateInteractionModeSettings, scene::SceneSettings,
         selection::SelectionSettings, windows::WindowsSettings,
@@ -46,6 +46,7 @@ pub mod debugging;
 pub mod general;
 pub mod graphics;
 pub mod keys;
+pub mod log;
 pub mod model;
 pub mod move_mode;
 pub mod navmesh;
@@ -81,6 +82,10 @@ pub struct SettingsData {
     pub navmesh: NavmeshSettings,
     #[reflect(tag = "Group.KeyBindings")]
     pub key_bindings: KeyBindings,
+    #[reflect(tag = "Group.Log")]
+    #[reflect(hidden)]
+    #[serde(default)]
+    pub log: LogSettings,
     #[reflect(hidden)]
     pub scene_settings: HashMap<PathBuf, SceneSettings>,
     #[reflect(hidden)]
@@ -122,11 +127,19 @@ impl DerefMut for Settings {
 
 impl Settings {
     pub fn load() -> Result<Self, SettingsError> {
+        let settings = SettingsData::load()?;
+        Log::set_log_info(settings.log.log_info);
+        Log::set_log_warning(settings.log.log_warning);
+        Log::set_log_error(settings.log.log_error);
         Ok(Settings {
-            settings: SettingsData::load()?,
+            settings,
             need_save: false,
             subscribers: Default::default(),
         })
+    }
+
+    pub fn data_mut(&mut self) -> &mut SettingsData {
+        &mut self.settings
     }
 
     pub fn force_save(&mut self) {

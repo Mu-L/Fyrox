@@ -2452,6 +2452,11 @@ impl Editor {
     fn update(&mut self, dt: f32, loop_controller: ApplicationLoopController) {
         for_each_plugin!(self.plugins => on_update(self, loop_controller));
 
+        let settings_data = self.settings.data_mut();
+        settings_data.log.log_info = Log::is_logging_info();
+        settings_data.log.log_warning = Log::is_logging_warning();
+        settings_data.log.log_error = Log::is_logging_error();
+
         self.handle_modes(dt);
 
         let ui = self.engine.user_interfaces.first_mut();
