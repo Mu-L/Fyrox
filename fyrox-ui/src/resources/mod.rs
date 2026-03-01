@@ -37,3 +37,6 @@ built_in_image!(CHECK = "check.png");
 built_in_image!(ADD = "add.png");
 built_in_image!(REMOVE = "cross.png");
 built_in_image!(SHUFFLE = "shuffle.png");
+built_in_image!(ERROR = "error.png");
+built_in_image!(WARNING = "warning.png");
+built_in_image!(INFO = "info.png");

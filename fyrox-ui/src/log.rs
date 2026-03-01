@@ -18,33 +18,28 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use crate::button::Button;
-use crate::dropdown_list::DropdownList;
-use crate::menu::MenuItem;
-use crate::scroll_viewer::ScrollViewer;
-use crate::stack_panel::StackPanel;
-use crate::utils::ImageButtonBuilder;
-use crate::window::Window;
 use crate::{
     border::BorderBuilder,
-    button::ButtonMessage,
+    button::{Button, ButtonMessage},
     copypasta::ClipboardProvider,
     core::{
-        log::{LogMessage, MessageKind},
+        color::Color,
+        log::{Log, LogMessage, MessageKind},
         pool::Handle,
     },
-    dropdown_list::{DropdownListBuilder, DropdownListMessage},
     grid::{Column, GridBuilder, Row},
-    menu::{ContextMenuBuilder, MenuItemBuilder, MenuItemContent, MenuItemMessage},
+    menu::{ContextMenuBuilder, MenuItem, MenuItemBuilder, MenuItemContent, MenuItemMessage},
     message::UiMessage,
     popup::{Placement, PopupBuilder, PopupMessage},
-    scroll_viewer::{ScrollViewerBuilder, ScrollViewerMessage},
-    stack_panel::StackPanelBuilder,
+    resources,
+    scroll_viewer::{ScrollViewer, ScrollViewerBuilder, ScrollViewerMessage},
+    stack_panel::{StackPanel, StackPanelBuilder},
     style::{resource::StyleResourceExt, Style},
     text::{Text, TextBuilder},
-    utils::make_dropdown_list_option,
+    toggle::{ToggleButton, ToggleButtonMessage},
+    utils::ImageButtonBuilder,
     widget::{WidgetBuilder, WidgetMessage},
-    window::{WindowAlignment, WindowBuilder, WindowMessage, WindowTitle},
+    window::{Window, WindowAlignment, WindowBuilder, WindowMessage, WindowTitle},
     BuildContext, HorizontalAlignment, Orientation, RcUiNodeHandle, Thickness, UiNode,
     UserInterface, VerticalAlignment,
 };
@@ -105,8 +100,9 @@ pub struct LogPanel {
     messages: Handle<StackPanel>,
     clear: Handle<Button>,
     receiver: Receiver<LogMessage>,
-    severity: MessageKind,
-    severity_list: Handle<DropdownList>,
+    log_info: Handle<ToggleButton>,
+    log_warning: Handle<ToggleButton>,
+    log_error: Handle<ToggleButton>,
     context_menu: ContextMenu,
     scroll_viewer: Handle<ScrollViewer>,
     pub message_count: usize,
@@ -121,7 +117,9 @@ impl LogPanel {
     ) -> Self {
         let messages;
         let clear;
-        let severity_list;
+        let log_info;
+        let log_warning;
+        let log_error;
         let scroll_viewer;
         let window = WindowBuilder::new(
             WidgetBuilder::new()
@@ -150,21 +148,40 @@ impl LogPanel {
                                     clear
                                 })
                                 .with_child({
-                                    severity_list = DropdownListBuilder::new(
-                                        WidgetBuilder::new()
-                                            .with_tab_index(Some(1))
-                                            .with_width(120.0)
-                                            .with_margin(Thickness::uniform(1.0)),
-                                    )
-                                    .with_items(vec![
-                                        make_dropdown_list_option(ctx, "Info+"),
-                                        make_dropdown_list_option(ctx, "Warnings+"),
-                                        make_dropdown_list_option(ctx, "Errors"),
-                                    ])
-                                    // Warnings+
-                                    .with_selected(1)
-                                    .build(ctx);
-                                    severity_list
+                                    log_info = ImageButtonBuilder::default()
+                                        .with_tooltip(
+                                            "Enable or disable logging of \
+                                            information messages.",
+                                        )
+                                        .with_image_color(Color::WHITE)
+                                        .with_is_toggled(Log::is_logging_info())
+                                        .with_image(resources::INFO.clone())
+                                        .build_toggle(ctx);
+                                    log_info
+                                })
+                                .with_child({
+                                    log_warning = ImageButtonBuilder::default()
+                                        .with_tooltip(
+                                            "Enable or disable logging of \
+                                        warning messages.",
+                                        )
+                                        .with_image_color(Color::WHITE)
+                                        .with_is_toggled(Log::is_logging_warning())
+                                        .with_image(resources::WARNING.clone())
+                                        .build_toggle(ctx);
+                                    log_warning
+                                })
+                                .with_child({
+                                    log_error = ImageButtonBuilder::default()
+                                        .with_tooltip(
+                                            "Enable or disable logging of \
+                                        error messages.",
+                                        )
+                                        .with_image_color(Color::WHITE)
+                                        .with_is_toggled(Log::is_logging_error())
+                                        .with_image(resources::ERROR.clone())
+                                        .build_toggle(ctx);
+                                    log_error
                                 }),
                         )
                         .with_orientation(Orientation::Horizontal)
@@ -204,8 +221,9 @@ impl LogPanel {
             messages,
             clear,
             receiver: message_receiver,
-            severity: MessageKind::Warning,
-            severity_list,
+            log_info,
+            log_warning,
+            log_error,
             context_menu,
             message_count: 0,
             scroll_viewer,
@@ -235,15 +253,15 @@ impl LogPanel {
     pub fn handle_ui_message(&mut self, message: &UiMessage, ui: &mut UserInterface) {
         if let Some(ButtonMessage::Click) = message.data_from(self.clear) {
             ui.send(self.messages, WidgetMessage::ReplaceChildren(vec![]));
-        } else if let Some(DropdownListMessage::Selection(Some(idx))) =
-            message.data_from(self.severity_list)
+        } else if let Some(ToggleButtonMessage::Toggled(value)) = message.data_from(self.log_info) {
+            Log::set_log_info(*value);
+        } else if let Some(ToggleButtonMessage::Toggled(value)) =
+            message.data_from(self.log_warning)
         {
-            match idx {
-                0 => self.severity = MessageKind::Information,
-                1 => self.severity = MessageKind::Warning,
-                2 => self.severity = MessageKind::Error,
-                _ => (),
-            };
+            Log::set_log_warning(*value);
+        } else if let Some(ToggleButtonMessage::Toggled(value)) = message.data_from(self.log_error)
+        {
+            Log::set_log_error(*value);
         }
 
         self.context_menu.handle_ui_message(message, ui);
@@ -273,10 +291,6 @@ impl LogPanel {
         let mut received_anything = false;
 
         while let Ok(msg) = self.receiver.try_recv() {
-            if msg.kind < self.severity {
-                continue;
-            }
-
             self.message_count += 1;
             received_anything = true;
 

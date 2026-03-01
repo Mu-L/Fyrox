@@ -315,6 +315,7 @@ pub struct ImageButtonBuilder<'a> {
     horizontal_alignment: HorizontalAlignment,
     vertical_alignment: VerticalAlignment,
     margin: Thickness,
+    is_toggled: bool,
 }
 
 impl<'a> Default for ImageButtonBuilder<'a> {
@@ -334,6 +335,7 @@ impl<'a> Default for ImageButtonBuilder<'a> {
             horizontal_alignment: HorizontalAlignment::Stretch,
             vertical_alignment: VerticalAlignment::Stretch,
             margin: Thickness::uniform(1.0),
+            is_toggled: false,
         }
     }
 }
@@ -421,6 +423,11 @@ impl<'a> ImageButtonBuilder<'a> {
         self
     }
 
+    pub fn with_is_toggled(mut self, is_toggled: bool) -> Self {
+        self.is_toggled = is_toggled;
+        self
+    }
+
     pub fn build_button(self, ctx: &mut BuildContext) -> Handle<Button> {
         ButtonBuilder::new(
             WidgetBuilder::new()
@@ -478,6 +485,7 @@ impl<'a> ImageButtonBuilder<'a> {
             .with_opt_texture(self.image)
             .build(ctx),
         )
+        .with_toggled(self.is_toggled)
         .build(ctx)
     }
 }
