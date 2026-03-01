@@ -60,7 +60,9 @@ static LOG: LazyLock<Mutex<Log>> = LazyLock::new(|| {
     Mutex::new(Log {
         #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
         file: None,
-        verbosity: MessageKind::Information,
+        log_info: true,
+        log_warning: true,
+        log_error: true,
         listeners: Default::default(),
         time_origin: Instant::now(),
         one_shot_sources: Default::default(),
@@ -95,7 +97,9 @@ impl MessageKind {
 pub struct Log {
     #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
     file: Option<std::fs::File>,
-    verbosity: MessageKind,
+    log_info: bool,
+    log_warning: bool,
+    log_error: bool,
     listeners: Vec<Sender<LogMessage>>,
     time_origin: Instant,
     one_shot_sources: FxHashMap<usize, String>,
@@ -125,63 +129,75 @@ impl Log {
     where
         S: AsRef<str>,
     {
+        match kind {
+            MessageKind::Information if !self.log_info => {
+                return false;
+            }
+            MessageKind::Warning if !self.log_warning => {
+                return false;
+            }
+            MessageKind::Error if !self.log_error => {
+                return false;
+            }
+            _ => (),
+        }
+
         let mut msg = message.as_ref().to_owned();
-        if kind as u32 >= self.verbosity as u32 {
-            if let Some(id) = id {
-                let mut need_write = false;
-                match self.one_shot_sources.entry(id) {
-                    Entry::Occupied(mut message) => {
-                        if message.get() != &msg {
-                            message.insert(msg.clone());
-                            need_write = true;
-                        }
-                    }
-                    Entry::Vacant(entry) => {
-                        entry.insert(msg.clone());
+
+        if let Some(id) = id {
+            let mut need_write = false;
+            match self.one_shot_sources.entry(id) {
+                Entry::Occupied(mut message) => {
+                    if message.get() != &msg {
+                        message.insert(msg.clone());
                         need_write = true;
                     }
                 }
-
-                if !need_write {
-                    return false;
+                Entry::Vacant(entry) => {
+                    entry.insert(msg.clone());
+                    need_write = true;
                 }
             }
 
-            // Notify listeners about the message and remove all disconnected listeners.
-            self.listeners.retain(|listener| {
-                listener
-                    .send(LogMessage {
-                        kind,
-                        content: msg.clone(),
-                        time: Instant::now() - self.time_origin,
-                    })
-                    .is_ok()
-            });
+            if !need_write {
+                return false;
+            }
+        }
 
-            msg.insert_str(0, kind.as_str());
+        // Notify listeners about the message and remove all disconnected listeners.
+        self.listeners.retain(|listener| {
+            listener
+                .send(LogMessage {
+                    kind,
+                    content: msg.clone(),
+                    time: Instant::now() - self.time_origin,
+                })
+                .is_ok()
+        });
 
-            #[cfg(target_arch = "wasm32")]
-            {
-                log(&msg);
+        msg.insert_str(0, kind.as_str());
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            log(&msg);
+        }
+
+        #[cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))]
+        {
+            if self.write_to_stdout {
+                let _ = io::stdout().write_all(msg.as_bytes());
             }
 
-            #[cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))]
-            {
-                if self.write_to_stdout {
-                    let _ = io::stdout().write_all(msg.as_bytes());
-                }
-
-                if let Some(log_file) = self.file.as_mut() {
-                    let _ = log_file.write_all(msg.as_bytes());
-                    let _ = log_file.flush();
-                }
+            if let Some(log_file) = self.file.as_mut() {
+                let _ = log_file.write_all(msg.as_bytes());
+                let _ = log_file.flush();
             }
+        }
 
-            #[cfg(target_os = "android")]
-            {
-                if self.write_to_stdout {
-                    let _ = io::stdout().write_all(msg.as_bytes());
-                }
+        #[cfg(target_os = "android")]
+        {
+            if self.write_to_stdout {
+                let _ = io::stdout().write_all(msg.as_bytes());
             }
         }
 
@@ -292,14 +308,28 @@ impl Log {
         LOG.lock().write_to_stdout
     }
 
-    /// Sets verbosity level.
-    pub fn set_verbosity(kind: MessageKind) {
-        LOG.lock().verbosity = kind;
+    pub fn set_log_info(state: bool) {
+        LOG.lock().log_info = state;
     }
 
-    /// Returns current verbosity level of the logger.
-    pub fn verbosity() -> MessageKind {
-        LOG.lock().verbosity
+    pub fn is_logging_info() -> bool {
+        LOG.lock().log_info
+    }
+
+    pub fn set_log_warning(state: bool) {
+        LOG.lock().log_warning = state;
+    }
+
+    pub fn is_logging_warning() -> bool {
+        LOG.lock().log_warning
+    }
+
+    pub fn set_log_error(state: bool) {
+        LOG.lock().log_error = state;
+    }
+
+    pub fn is_logging_error() -> bool {
+        LOG.lock().log_error
     }
 
     /// Adds a listener that will receive a copy of every message passed into the log.
