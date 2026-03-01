@@ -213,7 +213,6 @@ impl SettingsData {
 
         file.write_all(ron::ser::to_string_pretty(self, PrettyConfig::default())?.as_bytes())?;
 
-        Log::info("Settings were successfully saved!");
         Ok(())
     }
 }
