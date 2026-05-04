@@ -18,6 +18,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+//! Dynamic type (dyntype for short) is a user-defined data structure that supports additional
+//! features which makes it available from the editor and serializable to the standard asset format.
+
+#![warn(missing_docs)]
+
 use crate::{reflect::prelude::*, type_traits::prelude::*, visitor::prelude::*, SafeLock};
 use fxhash::FxHashMap;
 use parking_lot::{Mutex, MutexGuard};
@@ -27,12 +32,20 @@ use std::{
 };
 use uuid::Uuid;
 
+/// A set of errors that may occur while working with dyntypes.
 pub enum DynTypeError {
+    /// The inner container was empty. This error indicates that either the dyntype was in default
+    /// state, or its value was taken.
     Empty,
+    /// Unable to deserialize a dynamic type, because there's no DynTypeConstructorContainer provided!
     NoConstructorContainerProvided,
+    /// Unable to deserialize a dynamic type, because there's no constructor provided for the type!
     NoConstructorForTypeUuid(Uuid),
+    /// Unable to perform downcasting.
     TypeCast {
+        /// The actual name of the type.
         actual_type_name: &'static str,
+        /// The name of the requested type.
         requested_type_name: &'static str,
     },
 }
@@ -85,8 +98,12 @@ impl Debug for DynTypeError {
 
 impl std::error::Error for DynTypeError {}
 
+/// Dynamic type (dyntype for short) is a user-defined data structure that supports additional
+/// features which makes it available from the editor and serializable to the standard asset format.
 pub trait DynType: Reflect + Visit + Debug + FieldValue + Send {
+    /// Returns the type uuid of the value.
     fn type_uuid(&self) -> Uuid;
+    /// Creates a boxed copy of the value.
     fn clone_box(&self) -> Box<dyn DynType>;
 }
 
@@ -104,6 +121,7 @@ where
 }
 
 impl dyn DynType {
+    /// Tries to downcast the boxed version of the dyntype to the specified type.
     pub fn downcast<T: DynType>(self: Box<dyn DynType>) -> Result<Box<T>, Box<dyn DynType>> {
         if self.is::<T>() {
             Ok((self as Box<dyn Any>).downcast().unwrap())
@@ -112,16 +130,20 @@ impl dyn DynType {
         }
     }
 
+    /// Tries to downcast the boxed version of the dyntype to the specified type, unbox it and
+    /// return to the caller.
     pub fn take<T: DynType>(self: Box<dyn DynType>) -> Result<T, Box<dyn DynType>> {
         self.downcast::<T>().map(|value| *value)
     }
 
+    /// Checks whether the inner type is the same as the specified one.
     #[inline]
     pub fn is<T: DynType>(&self) -> bool {
         self.type_id() == TypeId::of::<T>()
     }
 }
 
+/// A container for a boxed dyntype.
 #[derive(Debug, TypeUuidProvider)]
 #[type_uuid(id = "87d9ef74-09a9-4228-a2d1-df270b50fddb")]
 pub struct DynTypeWrapper(pub Box<dyn DynType>);
@@ -233,10 +255,14 @@ impl Reflect for DynTypeWrapper {
     }
 }
 
+/// "Nullable" container for a dyntype. This container is essentially a wrapper for [`Option`] that
+/// supports additional functionality and handles serialization for you.
 #[derive(Default, Reflect, Clone, Debug)]
 pub struct DynTypeContainer(pub Option<DynTypeWrapper>);
 
 impl DynTypeContainer {
+    /// Tries to take and downcast the actual value in the container to the specified type and return it
+    /// to the caller.
     pub fn try_take<T: DynType>(&mut self) -> Result<T, DynTypeError> {
         match self.0.take() {
             None => Err(DynTypeError::Empty),
@@ -254,14 +280,18 @@ impl DynTypeContainer {
         }
     }
 
+    /// Tries to return a reference to the inner value. Returns [`None`] if the container is empty.
     pub fn value_ref(&self) -> Option<&dyn DynType> {
         self.0.as_ref().map(|v| &*v.0)
     }
 
+    /// Tries to return a reference to the inner value. Returns [`None`] if the container is empty.
     pub fn value_mut(&mut self) -> Option<&mut dyn DynType> {
         self.0.as_mut().map(|v| &mut *v.0)
     }
 
+    /// Tries downcast the actual value in the container to the specified type and return it
+    /// to the caller.
     pub fn data_ref<T: DynType>(&self) -> Result<&T, DynTypeError> {
         let value = self.value_ref().ok_or(DynTypeError::Empty)?;
         (value as &dyn Any)
@@ -272,6 +302,8 @@ impl DynTypeContainer {
             })
     }
 
+    /// Tries downcast the actual value in the container to the specified type and return it
+    /// to the caller.
     pub fn data_mut<T: DynType>(&mut self) -> Result<&mut T, DynTypeError> {
         let value = self.value_mut().ok_or(DynTypeError::Empty)?;
         let actual_type_name = Reflect::type_name(value);
@@ -320,21 +352,30 @@ impl Visit for DynTypeContainer {
     }
 }
 
+/// A type alias for a boxed closure that can be used to create an instance of a type that
+/// implements [`DynType`] trait.
 pub type DynTypeConstructor = Box<dyn Fn() -> Box<dyn DynType> + Send + 'static>;
 
+/// A set of parameters that describes a dyntype constructor. It's main purpose is to attach additional
+/// information (such as name) to make it human-friendly.
 pub struct DynTypeConstructorDefinition {
+    /// A human-readable name of the type that will be constructed by the constructor.
     pub name: String,
+    /// A boxed closure that creates instances of a dyntype.
     pub constructor: DynTypeConstructor,
     /// A name of the assembly this constructor is from.
     pub assembly_name: &'static str,
 }
 
+/// A set of constructors that allows to create a dyntype by its type uuid.
 #[derive(Default)]
 pub struct DynTypeConstructorContainer {
     map: Mutex<FxHashMap<Uuid, DynTypeConstructorDefinition>>,
 }
 
 impl DynTypeConstructorContainer {
+    /// Tries to create a dyntype by its type uuid. Returns [`None`] if there's no constructor
+    /// for the given uuid.
     pub fn try_create(&self, type_uuid: &Uuid) -> Option<Box<dyn DynType>> {
         self.map
             .safe_lock()
@@ -342,6 +383,8 @@ impl DynTypeConstructorContainer {
             .map(|c| (*c.constructor)())
     }
 
+    /// Registers a new type `T` that belongs to an entity `A` (usually a plugin) with the
+    /// human-readable `name`.
     pub fn add<T, A>(&self, name: &str) -> &Self
     where
         T: TypeUuidProvider + Default + DynType,
@@ -361,6 +404,7 @@ impl DynTypeConstructorContainer {
         self
     }
 
+    /// Adds a new constructor.
     pub fn add_custom(
         &self,
         type_uuid: Uuid,
@@ -374,14 +418,17 @@ impl DynTypeConstructorContainer {
         Ok(())
     }
 
+    /// Removes a constructor at the given uuid.
     pub fn remove(&self, type_uuid: &Uuid) -> Option<DynTypeConstructorDefinition> {
         self.map.safe_lock().remove(type_uuid)
     }
 
+    /// Returns an immutable reference to the inner container of constructors.
     pub fn inner(&self) -> MutexGuard<FxHashMap<Uuid, DynTypeConstructorDefinition>> {
         self.map.safe_lock()
     }
 
+    /// Removes all constructors at once.
     pub fn clear(&self) {
         self.inner().clear();
     }
