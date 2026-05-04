@@ -88,7 +88,6 @@ impl std::error::Error for DynTypeError {}
 pub trait DynType: Reflect + Visit + Debug + FieldValue + Send {
     fn type_uuid(&self) -> Uuid;
     fn clone_box(&self) -> Box<dyn DynType>;
-    fn into_any(self: Box<Self>) -> Box<dyn Any>;
 }
 
 impl<T> DynType for T
@@ -102,16 +101,12 @@ where
     fn clone_box(&self) -> Box<dyn DynType> {
         Box::new(self.clone())
     }
-
-    fn into_any(self: Box<Self>) -> Box<dyn Any> {
-        self
-    }
 }
 
 impl dyn DynType {
     pub fn downcast<T: DynType>(self: Box<dyn DynType>) -> Result<Box<T>, Box<dyn DynType>> {
         if self.is::<T>() {
-            Ok(DynType::into_any(self).downcast().unwrap())
+            Ok((self as Box<dyn Any>).downcast().unwrap())
         } else {
             Err(self)
         }
